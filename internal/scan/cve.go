@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anchore/clio"
@@ -114,13 +115,44 @@ func LoadDB(o Options) (vulnerability.Provider, DBInfo, error) {
 	return nil, DBInfo{}, fmt.Errorf("vulnerability database unavailable: %w", lastErr)
 }
 
-// Image scans an image.
+// Image scans an image, loading the database just for this call.
 func Image(ctx context.Context, img v1.Image, workDir string, o Options) (*Report, error) {
-	vp, dbInfo, err := LoadDB(o)
+	s, err := Open(o)
 	if err != nil {
 		return nil, err
 	}
-	defer vp.Close()
+	defer s.Close()
+	return s.Image(ctx, img, workDir, o)
+}
+
+// Scanner holds a loaded database; share one across platforms. Scans are
+// serialized (Syft/Grype are not documented as safe for concurrent use).
+type Scanner struct {
+	vp   vulnerability.Provider
+	info DBInfo
+	mu   sync.Mutex
+}
+
+// Open loads the database (update if due, mirror then public endpoint).
+func Open(o Options) (*Scanner, error) {
+	vp, info, err := LoadDB(o)
+	if err != nil {
+		return nil, err
+	}
+	return &Scanner{vp: vp, info: info}, nil
+}
+
+// Close releases the database.
+func (s *Scanner) Close() error { return s.vp.Close() }
+
+// Image scans one image with the loaded database.
+func (sc *Scanner) Image(ctx context.Context, img v1.Image, workDir string, o Options) (*Report, error) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	vp, dbInfo := sc.vp, sc.info
 
 	dir, err := os.MkdirTemp(workDir, "oci-")
 	if err != nil {
@@ -276,3 +308,6 @@ func writeSBOM(p string, s sbom.SBOM) error {
 
 // ErrGate is returned by callers when a gate fails.
 var ErrGate = errors.New("security gate failed")
+
+// Info describes the loaded database.
+func (sc *Scanner) Info() DBInfo { return sc.info }

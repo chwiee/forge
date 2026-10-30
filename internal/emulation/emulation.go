@@ -29,6 +29,8 @@ import (
 	ggcrcache "github.com/google/go-containerregistry/pkg/v1/cache"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"golang.org/x/sys/unix"
+
+	fcache "github.com/chwiee/forge/internal/cache"
 )
 
 // QemuImage is pinned by digest: the emulators are executable code, they must not change silently.
@@ -240,7 +242,7 @@ func (m *Manager) fetch(ctx context.Context, binary string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("pull emulators: %w", err)
 	}
-	img = ggcrcache.Image(img, ggcrcache.NewFilesystemCache(filepath.Join(m.CacheDir, "images")))
+	img = ggcrcache.Image(img, fcache.NewBlobCache(filepath.Join(m.CacheDir, "images")))
 	layers, err := img.Layers()
 	if err != nil {
 		return "", err

@@ -112,7 +112,18 @@ O destino é resolvido **antes** do build (credencial errada falha em segundos).
 - O OCI salvo por `forge run --oci` leva `dev.forge.gates=passed|failed`; `forge build` grava `unscanned`. `forge manifest` recusa `failed` e escaneia `unscanned` antes de publicar.
 - Índice: Docker manifest list se todas as imagens forem Docker schema 2, senão OCI image index.
 
-## Limitações conhecidas (v0.2)
+## Concorrência
+
+- `forge run` usa `errgroup`: o primeiro erro técnico cancela o `context` de todas as tarefas (RUN em andamento recebe SIGKILL via `exec.CommandContext`). A causa é a primeira erro devolvido, com prefixo da etapa; tarefas canceladas não imprimem erro, só `cancelled (<etapa> failed)`.
+- Builds usam um contexto filho (`context.WithCancelCause`): gate reprovado cancela só os builds pendentes, sem interromper scans em curso.
+- Cache de passos: `cache.Open` devolve um `Store` único por diretório com **lock por chave** — dois builds que chegam ao mesmo passo (stage `$BUILDPLATFORM`) executam uma vez só; o segundo pega do cache.
+- Cache de imagens base (`cache.BlobCache`): grava em temporário, confere o digest e renomeia (o fs cache do go-containerregistry grava no lugar e pode servir blob truncado). Índices por digest e por diffID.
+- Banco do Grype carregado uma vez (tarefa VulnDB); scans são serializados por mutex (Syft/Grype não garantem uso concorrente; o scan com o banco carregado leva 1-4 s). Scan, Sec e Leaks de uma imagem rodam em paralelo entre si.
+- Preflight do registry: ECR `DescribeRepositories` + `remote.CheckPushPermission` (pede token com escopo de push, não envia nada).
+- Deliberadamente **não** fazemos upload antecipado das camadas: uma camada com segredo poderia chegar ao registry (sem tag, mas baixável por digest) antes do gate de Leaks.
+- UI: região viva com uma linha por etapa ativa; no CI e com várias plataformas, sub-linhas prefixadas com a etapa.
+
+## Limitações conhecidas (v0.3)
 
 - `RUN --mount` (cache/secret/bind) é ignorado com aviso.
 - `ONBUILD` é ignorado.

@@ -22,9 +22,13 @@ type Report struct {
 	Context    string     `json:"context"`
 	Digest     string     `json:"digest,omitempty"` // index digest when multi-platform
 	Platforms  []Platform `json:"platforms"`
-	Push       *Push      `json:"push,omitempty"`
-	Passed     bool       `json:"passed"`
-	Failures   []string   `json:"failures,omitempty"`
+	// ContextLeaks is the build-context secret scan (done once, not per platform).
+	ContextLeaks *leaks.Report `json:"contextLeaks,omitempty"`
+	// Cancelled lists platforms whose build was stopped (gate failure elsewhere).
+	Cancelled []string `json:"cancelled,omitempty"`
+	Push      *Push    `json:"push,omitempty"`
+	Passed    bool     `json:"passed"`
+	Failures  []string `json:"failures,omitempty"`
 }
 
 // Platform is the result for one architecture.

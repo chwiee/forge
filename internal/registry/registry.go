@@ -99,7 +99,7 @@ func Resolve(ctx context.Context, o Options) (*Target, error) {
 		account := firstNonEmpty(o.ECRAccount, os.Getenv("FORGE_ECR_ACCOUNT"))
 		if account == "" {
 			if account, err = callerAccount(ctx, region); err != nil {
-				return nil, fmt.Errorf("ecr: cannot discover AWS account (use --ecr-account): %w", err)
+				return nil, fmt.Errorf("ecr: cannot discover AWS account: %w", awsHint(err))
 			}
 		}
 		host = fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com", account, region)
@@ -256,7 +256,7 @@ func (k *ecrKeychain) Resolve(res authn.Resource) (authn.Authenticator, error) {
 	}
 	out, err := ecr.NewFromConfig(cfg).GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{})
 	if err != nil {
-		return nil, fmt.Errorf("ecr: get authorization token: %w", err)
+		return nil, fmt.Errorf("ecr: get authorization token: %w", awsHint(err))
 	}
 	if len(out.AuthorizationData) == 0 {
 		return nil, errors.New("ecr: empty authorization data")
@@ -381,6 +381,51 @@ func explain(t *Target, err error) error {
 		return fmt.Errorf("ghcr: push to %s denied — set GITHUB_TOKEN (job permission packages: write) or GHCR_TOKEN (PAT with write:packages) and make sure the owner %q is right", t.Repo, t.Repo.RepositoryStr())
 	case ECR:
 		return fmt.Errorf("ecr: push to %s denied — refresh credentials (`aws login`), and check ecr:InitiateLayerUpload/PutImage permissions and that the repository exists (--create-repo)", t.Repo)
+	}
+	return err
+}
+
+// Preflight proves, without uploading anything, that the push will work:
+// the ECR repository exists (unless it was just created) and the credentials
+// get a token with push scope. Meant to run in parallel with the build.
+func Preflight(ctx context.Context, t *Target) error {
+	if t.Kind == ECR {
+		cfg, err := awsCfg(ctx, t.Region)
+		if err != nil {
+			return fmt.Errorf("ecr: AWS credentials: %w", err)
+		}
+		_, err = ecr.NewFromConfig(cfg).DescribeRepositories(ctx, &ecr.DescribeRepositoriesInput{RepositoryNames: []string{t.Repo.RepositoryStr()}})
+		var nf *ecrtypes.RepositoryNotFoundException
+		switch {
+		case errors.As(err, &nf):
+			return fmt.Errorf("ecr: repository %q does not exist in %s — create it or pass --create-repo", t.Repo.RepositoryStr(), t.Region)
+		case err != nil:
+			return fmt.Errorf("ecr: cannot read repository %q: %w", t.Repo.RepositoryStr(), awsHint(err))
+		}
+	}
+	if err := remote.CheckPushPermission(t.Ref(0), Keychain(), http.DefaultTransport); err != nil {
+		return explain(t, err)
+	}
+	return nil
+}
+
+// awsHint rewrites credential-chain errors into the action to take.
+func awsHint(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	for _, s := range []string{"login session has expired", "ExpiredToken", "token has expired", "SSO session", "refresh cached credentials"} {
+		if strings.Contains(msg, s) {
+			p := os.Getenv("AWS_PROFILE")
+			if p == "" {
+				p = "default"
+			}
+			return fmt.Errorf("AWS session expired (profile %s) — run `aws login --profile %s` and retry", p, p)
+		}
+	}
+	if strings.Contains(msg, "no EC2 IMDS role found") || strings.Contains(msg, "failed to retrieve credentials") {
+		return fmt.Errorf("no AWS credentials found — set AWS_PROFILE, run `aws login`, or use Pod Identity/IRSA in CI")
 	}
 	return err
 }

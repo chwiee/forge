@@ -171,6 +171,9 @@ func doBuild(ctx context.Context, u *ui.UI, g *globalFlags, f *buildFlags, conte
 	}
 	res, err := builder.Build(ctx, opts)
 	if err != nil {
+		if cancelled(ctx, st) {
+			return nil, err
+		}
 		st.Fail("failed")
 		var re *builder.RunError
 		if errors.As(err, &re) && len(re.Tail) > 0 && !u.Verbose() {
@@ -258,18 +261,24 @@ func doSlim(u *ui.UI, g *globalFlags, f *buildFlags, res *builder.Result, label 
 
 // ---- scan ----
 
-func doScan(ctx context.Context, u *ui.UI, g *globalFlags, gf *gateFlags, img v1.Image, label, sbomPath string) (*scan.Report, error) {
+func doScan(ctx context.Context, u *ui.UI, g *globalFlags, gf *gateFlags, sc *scan.Scanner, img v1.Image, label, sbomPath string) (*scan.Report, error) {
 	st := u.Start("Scan" + label)
 	st.Detail("loading vulnerability database", false)
 	work := filepath.Join(g.cacheDir, "work")
 	_ = os.MkdirAll(work, 0o755)
-	r, err := scan.Image(ctx, img, work, scan.Options{
+	scanFn := scan.Image
+	if sc != nil {
+		scanFn = sc.Image // database already loaded by the VulnDB task
+	}
+	r, err := scanFn(ctx, img, work, scan.Options{
 		CacheDir: g.cacheDir, DBURL: gf.dbURL, FailOn: gf.failOn, OnlyFixed: gf.onlyFixed,
 		Ignore: gf.ignoreCVE, SBOMPath: sbomPath, Version: Version,
 		OnDB: func(m string) { st.Detail(m, false) },
 	})
 	if err != nil {
-		st.Fail("error")
+		if !cancelled(ctx, st) {
+			st.Fail("error")
+		}
 		return nil, err
 	}
 	parts := []string{}
@@ -319,7 +328,7 @@ func sbomFor(base string, p v1.Platform, multi bool) string {
 
 // ---- sec ----
 
-func doSec(u *ui.UI, gf *gateFlags, res *builder.Result, img v1.Image, label string) (*sec.Report, error) {
+func doSec(ctx context.Context, u *ui.UI, gf *gateFlags, res *builder.Result, img v1.Image, label string) (*sec.Report, error) {
 	st := u.Start("Sec" + label)
 	cf, err := img.ConfigFile()
 	if err != nil {
@@ -327,7 +336,9 @@ func doSec(u *ui.UI, gf *gateFlags, res *builder.Result, img v1.Image, label str
 	}
 	r, err := sec.Check(sec.Input{Parsed: res.Parsed, Config: cf, AppLayers: appLayers(img, res.BaseLayers), MinScore: gf.minScore})
 	if err != nil {
-		st.Fail("error")
+		if !cancelled(ctx, st) {
+			st.Fail("error")
+		}
 		return nil, err
 	}
 	msg := fmt.Sprintf("score %d/100 (%s) · %d findings", r.Score, r.Grade, len(r.Findings))
@@ -365,7 +376,9 @@ func doLeaks(ctx context.Context, u *ui.UI, gf *gateFlags, res *builder.Result, 
 		Config: cf, FailOnContext: gf.failOnContext,
 	})
 	if err != nil {
-		st.Fail("error")
+		if !cancelled(ctx, st) {
+			st.Fail("error")
+		}
 		return nil, err
 	}
 	switch {
@@ -511,6 +524,9 @@ func colorIf(c func(string) string, n int, label string) string {
 // summarize collects gate failures of every platform.
 func summarize(rep *report.Report) {
 	multi := len(rep.Platforms) > 1
+	if rep.ContextLeaks != nil && rep.ContextLeaks.Failed {
+		rep.Failures = append(rep.Failures, "leaks: "+rep.ContextLeaks.Reason)
+	}
 	for _, p := range rep.Platforms {
 		pre := ""
 		if multi {

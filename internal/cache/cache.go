@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/v1"
@@ -23,6 +24,18 @@ import (
 // Store is a directory: blobs/<sha256>.tar.gz + keys/<key>.json
 type Store struct {
 	Dir string
+
+	locks sync.Map // key -> *sync.Mutex (singleflight between concurrent builds)
+}
+
+// Lock serializes work on one step key inside this process: when two platform
+// builds reach the same step (FROM --platform=$BUILDPLATFORM), the second waits
+// and then finds the layer in the cache instead of building it again.
+func (s *Store) Lock(key string) func() {
+	m, _ := s.locks.LoadOrStore(key, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // Entry is the cached result of one build step.
@@ -35,14 +48,27 @@ type Entry struct {
 	Step    string    `json:"step,omitempty"`
 }
 
-// Open creates the directory layout if needed.
+// stores keeps one Store per directory so locks are shared by every build in the process.
+var (
+	storesMu sync.Mutex
+	stores   = map[string]*Store{}
+)
+
+// Open creates the directory layout if needed and returns the shared Store for dir.
 func Open(dir string) (*Store, error) {
+	storesMu.Lock()
+	defer storesMu.Unlock()
+	if s, ok := stores[dir]; ok {
+		return s, nil
+	}
 	for _, d := range []string{"blobs", "keys", "tmp"} {
 		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
 			return nil, err
 		}
 	}
-	return &Store{Dir: dir}, nil
+	s := &Store{Dir: dir}
+	stores[dir] = s
+	return s, nil
 }
 
 // Key hashes the parts of a step into a cache key.
@@ -79,11 +105,19 @@ func (s *Store) Get(key string) (*Entry, bool) {
 // Put records an entry for key.
 func (s *Store) Put(key string, e Entry) error {
 	b, _ := json.Marshal(e)
-	tmp := filepath.Join(s.Dir, "keys", key+".json.tmp")
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	f, err := os.CreateTemp(filepath.Join(s.Dir, "tmp"), "key-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(s.Dir, "keys", key+".json"))
+	_, err = f.Write(b)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return err
+	}
+	return os.Rename(f.Name(), filepath.Join(s.Dir, "keys", key+".json"))
 }
 
 func (s *Store) blobPath(digest string) string {

@@ -155,7 +155,7 @@ func Build(ctx context.Context, o Options) (*Result, error) {
 		opts:     o,
 		parsed:   parsed,
 		store:    store,
-		imgCache: ggcrcache.NewFilesystemCache(filepath.Join(o.CacheDir, "images")),
+		imgCache: cache.NewBlobCache(filepath.Join(o.CacheDir, "images")),
 		work:     work,
 		ignore:   ig,
 		ids:      rootfs.CurrentIDMap(),
@@ -403,6 +403,12 @@ func (b *builder) applyCached(root string, e cache.Entry) error {
 
 // fsStep runs a filesystem-changing step with caching.
 func (b *builder) fsStep(st *stage, key, text string, fn func(root string) error) (bool, error) {
+	// another platform build may be producing this very step right now: wait for it
+	unlock := b.store.Lock(key)
+	defer unlock()
+	if err := b.ctx.Err(); err != nil {
+		return false, err
+	}
 	if !b.opts.NoCache {
 		if e, ok := b.store.Get(key); ok {
 			if st.materialized && !e.Empty {

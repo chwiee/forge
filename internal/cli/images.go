@@ -256,7 +256,7 @@ func newScanCmd(g *globalFlags) *cobra.Command {
 			for _, s := range srcs {
 				u.Line("")
 				label := platformLabel(s.platform, multi)
-				r, err := doScan(cmd.Context(), u, g, gf, s.image, label, sbomFor(gf.sbom, s.platform, multi))
+				r, err := doScan(cmd.Context(), u, g, gf, nil, s.image, label, sbomFor(gf.sbom, s.platform, multi))
 				if err != nil {
 					return err
 				}
@@ -376,7 +376,7 @@ sources (forge build, or OCI written elsewhere) are scanned first.`,
 					return &gateError{msg: "refusing to publish an image that failed the gates"}
 				case s.gates == gatesUnscanned && !skipScan:
 					u.Line("")
-					r, err := doScan(ctx, u, g, gf, s.image, label, "")
+					r, err := doScan(ctx, u, g, gf, nil, s.image, label, "")
 					if err != nil {
 						return err
 					}

@@ -71,6 +71,30 @@ Flags principais do `run`:
 --create-repo (ECR)      --ecr-account/--region --owner (GHCR)
 ```
 
+## Pipeline concorrente
+
+O `forge run` executa um grafo de dependências, não uma fila:
+
+```
+            ┌─ Registry (credencial + permissão de push + repositório existe) ─┐
+ início ────┼─ VulnDB (banco de CVEs, carregado uma vez) ──┐                   │
+            ├─ Context (segredos no contexto de build)     │                   │
+            ├─ Build amd64 → Slim ─┬─ Scan ◄───────────────┤                   ├─► gates ─► Push (tag)
+            │                      ├─ Sec                  │                   │
+            │                      └─ Leaks                │                   │
+            └─ Build arm64 → Slim ─┴─ (idem) ◄─────────────┘───────────────────┘
+```
+
+| Situação | Comportamento |
+|---|---|
+| Erro técnico (sessão AWS expirada, banco indisponível, RUN quebrado) | cancela **tudo** na hora; a mensagem nomeia a etapa (`registry: AWS session expired — run aws login`); as outras aparecem como `○ cancelled (registry failed)` |
+| Gate reprovado numa plataforma | as verificações daquela imagem terminam (relatório completo), os builds ainda em andamento são cancelados, o push é bloqueado |
+| `--fail-fast` | cancela tudo no primeiro gate reprovado |
+| `--jobs N` | limita builds simultâneos (RUN emulado usa muita CPU) |
+
+Medido no WSL: sessão AWS expirada derruba o pipeline em **0,45 s** (antes: depois do build inteiro);
+multi-arch amd64+arm64 sem cache em **~12 s** (sequencial: ~20 s com cache).
+
 ## Multi-arch (amd64 + arm64 numa tag só)
 
 ```bash

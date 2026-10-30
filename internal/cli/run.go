@@ -1,17 +1,25 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/spf13/cobra"
 
 	"github.com/chwiee/forge/internal/builder"
+	"github.com/chwiee/forge/internal/ignore"
+	"github.com/chwiee/forge/internal/leaks"
 	"github.com/chwiee/forge/internal/registry"
 	"github.com/chwiee/forge/internal/report"
+	"github.com/chwiee/forge/internal/scan"
+	"github.com/chwiee/forge/internal/slim"
 	"github.com/chwiee/forge/internal/ui"
 )
 
@@ -56,18 +64,28 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 	bf := &buildFlags{}
 	gf := &gateFlags{}
 	pf := &pushFlags{}
-	var noPush bool
+	var noPush, failFast bool
 	var reportPath, ociOut string
+	var jobs int
 
 	c := &cobra.Command{
 		Use:   "run [context]",
-		Short: "Build → Slim → Scan → Sec → Leaks → Push (the whole pipeline, one or many platforms)",
+		Short: "Build → Slim → Scan → Sec → Leaks → Push, concurrently (one or many platforms)",
+		Long: `Runs the whole pipeline as a dependency graph:
+
+  registry preflight, vulnerability DB and build-context leaks start together
+  with the build; each platform builds in parallel; scan, sec and leaks of an
+  image run in parallel as soon as it is built; the tag is written only after
+  every gate passed.
+
+A technical error anywhere cancels everything and names the failing stage.
+A failed gate lets the checks of that image finish (complete report), cancels
+the remaining builds and blocks the push; --fail-fast cancels at once.`,
 		Example: `  forge run . --registry ecr --name payments-api --tag v1.4.0
   forge run . --registry ghcr --name api --platform linux/amd64,linux/arm64
   forge run . --no-push --oci out/arm64     # native runner; join later with forge manifest`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := cmd.Context()
 			contextDir := "."
 			if len(args) == 1 {
 				contextDir = args[0]
@@ -81,6 +99,9 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 				return err
 			}
 			multi := len(platforms) > 1
+			if jobs <= 0 || jobs > len(platforms) {
+				jobs = len(platforms)
+			}
 
 			u := ui.New(g.verbose)
 			defer u.Close()
@@ -95,82 +116,209 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 				u.Info("platforms", u.Value(strings.Join(names, " · ")))
 			}
 			warnWindowsMount(u, contextDir, g.cacheDir)
+			u.Line("")
+			u.SetConcurrent(multi)
 
-			rep := &report.Report{Version: Version, Started: start.UTC(), Context: contextDir}
+			rep := &report.Report{Version: Version, Started: start.UTC(), Context: contextDir, Dockerfile: bf.file}
+			if rep.Dockerfile == "" {
+				rep.Dockerfile = filepath.Join(contextDir, "Dockerfile")
+			}
 
-			// resolve the destination first: bad credentials fail in seconds, not after the build
+			// errgroup: the first technical error cancels gctx for every task.
+			grp, gctx := errgroup.WithContext(cmd.Context())
+			// builds get their own context so a failed gate can stop them without
+			// interrupting the checks already running.
+			buildCtx, cancelBuilds := context.WithCancelCause(gctx)
+			defer cancelBuilds(nil)
+
+			// ---- preflight: registry ----
 			var target *registry.Target
 			if !noPush {
-				if target, err = registry.Resolve(ctx, pf.options()); err != nil {
-					return err
-				}
-				u.Info("target", u.Value(target.String()))
+				grp.Go(func() error {
+					st := u.Start("Registry")
+					st.Detail("resolving "+pf.registry+" target", false)
+					t, err := registry.Resolve(gctx, pf.options())
+					if err == nil {
+						st.Detail("checking push permission on "+t.String(), false)
+						err = registry.Preflight(gctx, t)
+					}
+					if err != nil {
+						if !cancelled(gctx, st) {
+							st.Fail("not ready")
+						}
+						return stageErr("registry", err)
+					}
+					target = t
+					st.Done(t.String() + " · push allowed")
+					return nil
+				})
 			}
 
-			var runs []*platformRun
+			// ---- preflight: vulnerability DB ----
+			var scanner *scan.Scanner
+			dbReady := make(chan struct{})
+			grp.Go(func() error {
+				st := u.Start("VulnDB")
+				s, err := scan.Open(scan.Options{CacheDir: g.cacheDir, DBURL: gf.dbURL, Version: Version,
+					OnDB: func(m string) { st.Detail(m, false) }})
+				if err != nil {
+					if !cancelled(gctx, st) {
+						st.Fail("unavailable")
+					}
+					return stageErr("vulnerability DB", err)
+				}
+				scanner = s
+				close(dbReady)
+				st.Done(fmt.Sprintf("ready · built %s", s.Info().Built.Format("2006-01-02 15:04")))
+				return nil
+			})
+			defer func() {
+				if scanner != nil {
+					scanner.Close()
+				}
+			}()
+
+			// ---- preflight: secrets in the build context (once) ----
+			grp.Go(func() error {
+				st := u.Start("Context")
+				st.Detail("scanning build context for secrets", false)
+				ig, err := ignore.Load(contextDir)
+				if err != nil {
+					st.Fail("error")
+					return stageErr("context", err)
+				}
+				r, err := leaks.Scan(gctx, leaks.Options{ContextDir: contextDir, Ignore: ig, FailOnContext: gf.failOnContext})
+				if err != nil {
+					if !cancelled(gctx, st) {
+						st.Fail("error")
+					}
+					return stageErr("context leaks", err)
+				}
+				rep.ContextLeaks = r
+				switch {
+				case r.Failed:
+					st.Fail(fmt.Sprintf("%d secret(s) in the build context", len(r.Findings)))
+				case len(r.Findings) > 0:
+					st.Warn(fmt.Sprintf("%d secret(s) in the build context (not shipped)", len(r.Findings)))
+				default:
+					st.Done(fmt.Sprintf("no secrets · %d files", r.Scanned))
+				}
+				return nil
+			})
+
+			// ---- one pipeline per platform ----
+			runs := make([]*platformRun, len(platforms))
+			sem := make(chan struct{}, jobs)
 			for i, p := range platforms {
-				label := platformLabel(p, multi)
-				u.Line("")
-				if multi {
-					u.Line("  " + u.Accent("◆ "+builder.PlatformString(p)))
-				}
-				res, err := doBuild(ctx, u, g, bf, contextDir, p, label)
-				if err != nil {
-					return err
-				}
-				rep.Dockerfile = res.Parsed.Path
-				pr := &platformRun{platform: res.Platform}
-				pr.rep.Platform = builder.PlatformString(res.Platform)
-				pr.rep.Build = report.Build{Steps: res.Steps, Cached: res.Cached, Isolation: res.Isolation, Duration: res.Duration.Round(time.Millisecond).String()}
+				grp.Go(func() error {
+					label := platformLabel(p, multi)
+					stage := "build" + label
+					select {
+					case sem <- struct{}{}:
+					case <-buildCtx.Done():
+						return nil
+					}
+					res, err := doBuild(buildCtx, u, g, bf, contextDir, p, label)
+					if err == nil {
+						var sr *slim.Result
+						if sr, err = doSlim(u, g, bf, res, label); err == nil {
+							runs[i] = &platformRun{platform: res.Platform, image: sr.Image}
+							runs[i].rep.Slim = &report.Slim{Applied: sr.Applied, Reason: sr.Reason, SizeBefore: sr.SizeBefore, SizeAfter: sr.SizeAfter, LayersBefore: sr.LayersBefore, LayersAfter: sr.LayersAfter, Removed: sr.Removed}
+						}
+					}
+					<-sem
+					if err != nil {
+						if errors.Is(context.Cause(buildCtx), errGatesFailed) {
+							return nil // stopped on purpose; the gate failure is reported
+						}
+						return stageErr(stage, err)
+					}
+					pr := runs[i]
+					pr.rep.Platform = builder.PlatformString(res.Platform)
+					pr.rep.Build = report.Build{Steps: res.Steps, Cached: res.Cached, Isolation: res.Isolation, Duration: res.Duration.Round(time.Millisecond).String()}
+					dg, _ := pr.image.Digest()
+					layers, _ := pr.image.Layers()
+					pr.rep.Image = report.Image{Digest: dg.String(), Base: res.BaseRef, Size: imageSize(pr.image), Layers: len(layers)}
 
-				sr, err := doSlim(u, g, bf, res, label)
-				if err != nil {
-					return err
-				}
-				pr.image = sr.Image
-				pr.rep.Slim = &report.Slim{Applied: sr.Applied, Reason: sr.Reason, SizeBefore: sr.SizeBefore, SizeAfter: sr.SizeAfter, LayersBefore: sr.LayersBefore, LayersAfter: sr.LayersAfter, Removed: sr.Removed}
+					// scan · sec · leaks in parallel (scan waits for the DB task)
+					vg, vctx := errgroup.WithContext(gctx)
+					vg.Go(func() error {
+						select {
+						case <-dbReady:
+						case <-vctx.Done():
+							return vctx.Err()
+						}
+						r, err := doScan(vctx, u, g, gf, scanner, pr.image, label, sbomFor(gf.sbom, res.Platform, multi))
+						pr.rep.CVE = r
+						return stageErr("scan"+label, err)
+					})
+					vg.Go(func() error {
+						r, err := doSec(vctx, u, gf, res, pr.image, label)
+						pr.rep.Sec = r
+						return stageErr("sec"+label, err)
+					})
+					vg.Go(func() error {
+						r, err := doLeaks(vctx, u, gf, res, pr.image, "", label)
+						pr.rep.Leaks = r
+						return stageErr("leaks"+label, err)
+					})
+					if err := vg.Wait(); err != nil {
+						return err
+					}
+					if reason := gateFailure(pr.rep); reason != "" {
+						if failFast {
+							return &gateError{msg: pr.rep.Platform + ": " + reason}
+						}
+						cancelBuilds(errGatesFailed)
+					}
+					return nil
+				})
+			}
 
-				if pr.rep.CVE, err = doScan(ctx, u, g, gf, pr.image, label, sbomFor(gf.sbom, res.Platform, multi)); err != nil {
-					return err
+			err = grp.Wait()
+			var ge *gateError
+			if err != nil && !errors.As(err, &ge) {
+				return err // technical failure: root cause, stage-prefixed
+			}
+
+			for i, r := range runs {
+				if r != nil && r.rep.Platform != "" {
+					rep.Platforms = append(rep.Platforms, r.rep)
+				} else {
+					rep.Cancelled = append(rep.Cancelled, builder.PlatformString(platforms[i]))
 				}
-				if pr.rep.Sec, err = doSec(u, gf, res, pr.image, label); err != nil {
-					return err
-				}
-				ctxDir := ""
-				if i == 0 {
-					ctxDir = contextDir // the build context is the same for every platform
-				}
-				if pr.rep.Leaks, err = doLeaks(ctx, u, gf, res, pr.image, ctxDir, label); err != nil {
-					return err
-				}
-				dg, _ := pr.image.Digest()
-				layers, _ := pr.image.Layers()
-				pr.rep.Image = report.Image{Digest: dg.String(), Base: res.BaseRef, Size: imageSize(pr.image), Layers: len(layers)}
-				rep.Platforms = append(rep.Platforms, pr.rep)
-				runs = append(runs, pr)
 			}
 			summarize(rep)
-
-			// what gets pushed: one image, or an index pointing at every platform
-			var art registry.Artifact = runs[0].image
-			if multi {
-				items := make([]registry.PlatformImage, len(runs))
-				for i, r := range runs {
-					items[i] = registry.PlatformImage{Image: r.image, Platform: r.platform}
-				}
-				idx, err := registry.Index(items)
-				if err != nil {
-					return err
-				}
-				art = idx
-				if d, err := idx.Digest(); err == nil {
-					rep.Digest = d.String()
+			if len(rep.Cancelled) > 0 {
+				rep.Passed = false
+				if len(rep.Failures) == 0 {
+					rep.Failures = append(rep.Failures, "not built: "+strings.Join(rep.Cancelled, ", "))
 				}
 			}
 
-			if ociOut != "" {
-				if err := saveRuns(runs, ociOut, gateState(rep.Passed)); err != nil {
-					return err
+			// what gets pushed: one image, or an index pointing at every platform
+			var art registry.Artifact
+			if len(rep.Platforms) == len(platforms) {
+				if multi {
+					items := make([]registry.PlatformImage, len(runs))
+					for i, r := range runs {
+						items[i] = registry.PlatformImage{Image: r.image, Platform: r.platform}
+					}
+					idx, err := registry.Index(items)
+					if err != nil {
+						return err
+					}
+					art = idx
+					if d, err := idx.Digest(); err == nil {
+						rep.Digest = d.String()
+					}
+				} else {
+					art = runs[0].image
+				}
+				if ociOut != "" {
+					if err := saveRuns(runs, ociOut, gateState(rep.Passed)); err != nil {
+						return err
+					}
 				}
 			}
 
@@ -180,11 +328,11 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 				u.Start("Push").Skip("skipped (--no-push)")
 			case !rep.Passed:
 				u.Start("Push").Fail("blocked by security gates")
-				rep.Push = &report.Push{Registry: target.Kind, Skipped: "gates failed"}
+				rep.Push = &report.Push{Registry: pf.registry, Skipped: "gates failed"}
 			default:
-				digest, err := doPush(ctx, u, art, target)
+				digest, err := doPush(cmd.Context(), u, art, target)
 				if err != nil {
-					return err
+					return stageErr("push", err)
 				}
 				refs := []string{}
 				for i := range target.Tags {
@@ -193,12 +341,15 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 				rep.Push = &report.Push{Registry: target.Kind, Refs: refs, Digest: digest}
 			}
 
-			for _, r := range runs {
+			if rep.ContextLeaks != nil && len(rep.ContextLeaks.Findings) > 0 {
+				printDetails(u, "", nil, nil, rep.ContextLeaks)
+			}
+			for _, p := range rep.Platforms {
 				title := ""
 				if multi {
-					title = r.rep.Platform
+					title = p.Platform
 				}
-				printDetails(u, title, r.rep.CVE, r.rep.Sec, r.rep.Leaks)
+				printDetails(u, title, p.CVE, p.Sec, p.Leaks)
 			}
 
 			rep.Duration = time.Since(start).Round(time.Millisecond).String()
@@ -217,9 +368,26 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 	gf.register(c)
 	pf.register(c)
 	c.Flags().BoolVar(&noPush, "no-push", false, "run everything except the push")
+	c.Flags().BoolVar(&failFast, "fail-fast", false, "cancel everything at the first failed gate (default: finish the checks of that image for a complete report)")
+	c.Flags().IntVar(&jobs, "jobs", 0, "platforms built at the same time (default: all)")
 	c.Flags().StringVar(&reportPath, "report", ".forge/report.json", "JSON report path (empty disables)")
 	c.Flags().StringVar(&ociOut, "oci", "", "also save the result as an OCI layout directory (input for forge push/manifest)")
 	return c
+}
+
+// gateFailure returns why one platform failed its gates ("" = passed).
+func gateFailure(p report.Platform) string {
+	var r []string
+	if p.CVE != nil && p.CVE.Failed {
+		r = append(r, "cve: "+p.CVE.Reason)
+	}
+	if p.Sec != nil && p.Sec.Failed {
+		r = append(r, "sec: "+p.Sec.Reason)
+	}
+	if p.Leaks != nil && p.Leaks.Failed {
+		r = append(r, "leaks: "+p.Leaks.Reason)
+	}
+	return strings.Join(r, "; ")
 }
 
 func gateState(passed bool) string {
@@ -236,7 +404,7 @@ func printSummary(u *ui.UI, rep *report.Report, target *registry.Target, d time.
 	} else if target != nil {
 		rows = append(rows, ui.Row{Key: "image", Value: u.Muted(target.String() + " (not pushed)")})
 	}
-	if len(rep.Platforms) == 1 {
+	if len(rep.Platforms) == 1 && len(rep.Cancelled) == 0 {
 		p := rep.Platforms[0]
 		rows = append(rows, ui.Row{Key: "digest", Value: u.Muted(shortDigest(p.Image.Digest))})
 		rows = append(rows, ui.Row{Key: "base", Value: u.Muted(shortRef(p.Image.Base))})
@@ -252,7 +420,9 @@ func printSummary(u *ui.UI, rep *report.Report, target *registry.Target, d time.
 		rows = append(rows, scoreRow(u, p))
 		rows = append(rows, secretsRow(u, p))
 	} else {
-		rows = append(rows, ui.Row{Key: "index", Value: u.Muted(shortDigest(rep.Digest))})
+		if rep.Digest != "" {
+			rows = append(rows, ui.Row{Key: "index", Value: u.Muted(shortDigest(rep.Digest))})
+		}
 		for _, p := range rep.Platforms {
 			arch := strings.TrimPrefix(p.Platform, "linux/")
 			size := ui.HumanBytes(p.Image.Size)
@@ -269,6 +439,9 @@ func printSummary(u *ui.UI, rep *report.Report, target *registry.Target, d time.
 			}
 			rows = append(rows, ui.Row{Key: arch, Value: fmt.Sprintf("%s · %s/%s cve · score %s",
 				u.Bold(size), colorIf(u.Bad, crit, "C"), colorIf(u.Warning, high, "H"), score)})
+		}
+		for _, c := range rep.Cancelled {
+			rows = append(rows, ui.Row{Key: strings.TrimPrefix(c, "linux/"), Value: u.Muted("cancelled (not built)")})
 		}
 	}
 	if reportPath != "" {

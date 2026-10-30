@@ -39,12 +39,15 @@ type UI struct {
 	color   bool
 	verbose bool
 
-	mu     sync.Mutex
-	active *Step
-	stop   chan struct{}
-	done   chan struct{}
-	frame  int
-	width  int
+	mu      sync.Mutex
+	active  []*Step // steps running now (several when the pipeline runs in parallel)
+	drawn   int     // spinner lines currently on screen (TTY)
+	tagSubs bool    // prefix sub-lines with the step name (concurrent steps)
+	nameW   int     // width of the step-name column
+	stop    chan struct{}
+	done    chan struct{}
+	frame   int
+	width   int
 }
 
 // New detects terminal capabilities from the environment.
@@ -64,6 +67,7 @@ func New(verbose bool) *UI {
 		color:   colorEnabled(tty),
 		verbose: verbose,
 		width:   width,
+		nameW:   7,
 	}
 }
 
@@ -155,7 +159,11 @@ type Step struct {
 func (u *UI) Start(name string) *Step {
 	s := &Step{u: u, name: name, start: time.Now(), pct: -1}
 	u.mu.Lock()
-	u.active = s
+	u.clearLocked()
+	if l := utf8.RuneCountInString(name); l > u.nameW {
+		u.nameW = l
+	}
+	u.active = append(u.active, s)
 	if !u.tty {
 		fmt.Fprintf(u.out, "  %s %s\n", u.paint(cEmber, "▸"), u.bold(name))
 	} else if u.stop == nil {
@@ -193,8 +201,20 @@ func (s *Step) Sub(icon, msg string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.clearLocked()
-	fmt.Fprintf(u.out, "    %s %s\n", icon, msg)
+	if u.tagSubs {
+		fmt.Fprintf(u.out, "    %s %s %s\n", u.paint(cDim, pad(s.name, u.nameW)+" │"), icon, msg)
+	} else {
+		fmt.Fprintf(u.out, "    %s %s\n", icon, msg)
+	}
 	u.drawLocked()
+}
+
+// SetConcurrent tells the UI several steps run at once: sub-lines get the step
+// name so interleaved output stays readable (TTY and CI logs).
+func (u *UI) SetConcurrent(on bool) {
+	u.mu.Lock()
+	u.tagSubs = on
+	u.mu.Unlock()
 }
 
 // SubOK / SubCached / SubWarn are convenience wrappers over Sub.
@@ -224,10 +244,14 @@ func (s *Step) finish(icon, summary string, c int) {
 	s.ended = true
 	u.clearLocked()
 	el := u.paint(cDim, fmtDuration(time.Since(s.start)))
-	fmt.Fprintf(u.out, "  %s %s %s %s\n", icon, u.bold(pad(s.name, 7)), u.paint(c, summary), el)
-	if u.active == s {
-		u.active = nil
+	fmt.Fprintf(u.out, "  %s %s %s %s\n", icon, u.bold(pad(s.name, u.nameW)), u.paint(c, summary), el)
+	for i, a := range u.active {
+		if a == s {
+			u.active = append(u.active[:i], u.active[i+1:]...)
+			break
+		}
 	}
+	u.drawLocked()
 }
 
 // Close stops the animation goroutine. Call once at program end.
@@ -263,28 +287,42 @@ func (u *UI) animate(stop, done chan struct{}) {
 	}
 }
 
-// clearLocked erases the spinner line (TTY only).
+// clearLocked erases the spinner region (TTY only); the cursor ends at its first line.
 func (u *UI) clearLocked() {
-	if u.tty && u.active != nil {
-		fmt.Fprint(u.out, "\r\x1b[2K")
-	}
-}
-
-// drawLocked renders the spinner line for the active step (TTY only, no newline).
-func (u *UI) drawLocked() {
-	if !u.tty || u.active == nil {
+	if !u.tty || u.drawn == 0 {
 		return
 	}
-	s := u.active
+	fmt.Fprint(u.out, "\r\x1b[2K")
+	for i := 1; i < u.drawn; i++ {
+		fmt.Fprint(u.out, "\x1b[1A\x1b[2K")
+	}
+	u.drawn = 0
+}
+
+// drawLocked renders one spinner line per running step (TTY only, no trailing newline).
+func (u *UI) drawLocked() {
+	if !u.tty || len(u.active) == 0 {
+		return
+	}
+	for i, s := range u.active {
+		if i > 0 {
+			fmt.Fprint(u.out, "\n")
+		}
+		u.drawStep(s)
+	}
+	u.drawn = len(u.active)
+}
+
+func (u *UI) drawStep(s *Step) {
 	frame := u.paint(cEmber, spinnerFrames[u.frame%len(spinnerFrames)])
-	head := fmt.Sprintf("  %s %s ", frame, u.bold(pad(s.name, 7)))
+	head := fmt.Sprintf("  %s %s ", frame, u.bold(pad(s.name, u.nameW)))
 	tail := " " + u.paint(cDim, fmtDuration(time.Since(s.start)))
 	bar := ""
 	if s.pct >= 0 {
 		bar = progressBar(u, s.pct) + " "
 	}
 	// visible width budget for the detail text
-	used := 2 + 2 + 7 + 1 + visibleLen(bar) + 8
+	used := 2 + 2 + u.nameW + 1 + visibleLen(bar) + 8
 	room := u.width - used - 1
 	detail := truncate(oneLine(s.detail), room)
 	fmt.Fprint(u.out, head+bar+u.paint(cGray, detail)+tail)

@@ -53,7 +53,8 @@ vira linhas estáticas coloridas (sem `\r`, legível no log do Azure DevOps/GitL
 | `forge run [ctx]` | pipeline inteiro (o que o CI usa) |
 | `forge build [ctx]` | build + slim; salva OCI (`--oci`) e/ou tar (`--tar`, para `docker load`/`kind load`) |
 | `forge scan <oci-dir\|ref>` | só CVEs, de uma imagem local ou de registry |
-| `forge push <oci-dir>` | publica uma imagem já construída (gate de CVE antes) |
+| `forge push <oci-dir\|ref>...` (alias `manifest`) | publica uma imagem, ou junta várias (uma por arquitetura) numa tag multi-arch |
+| `forge emulation status\|install\|uninstall` | emulação QEMU para RUN de outra arquitetura |
 | `forge db serve\|sync\|update` | espelho do banco de CVEs / aquecer cache |
 | `forge cache ls\|prune` | uso e limpeza do cache |
 | `forge doctor` | diz o que esta máquina/pod suporta |
@@ -69,6 +70,23 @@ Flags principais do `run`:
 --no-push                --no-cache             --report .forge/report.json
 --create-repo (ECR)      --ecr-account/--region --owner (GHCR)
 ```
+
+## Multi-arch (amd64 + arm64 numa tag só)
+
+```bash
+sudo forge run . --registry ecr --name api --platform linux/amd64,linux/arm64
+```
+
+O forge constrói uma imagem por plataforma (build, slim, scan, sec e leaks **para cada uma**) e publica
+**uma tag** (manifest list / OCI index): `docker pull` e o kubelet escolhem a arquitetura sozinhos.
+
+| Peça | Como funciona |
+|---|---|
+| Dockerfile multi-arch padrão | `FROM --platform=$BUILDPLATFORM` + `ARG TARGETOS TARGETARCH`: o stage de compilação roda **nativo** e faz cross-compile; o cache é compartilhado entre as plataformas. Exemplo: [`examples/multiarch`](examples/multiarch/Dockerfile). |
+| RUN de outra arquitetura | o forge baixa o QEMU estático de uma imagem fixada por digest (`tonistiigi/binfmt`, a mesma fonte do buildx) e registra no `binfmt_misc` do kernel — sem daemon, sem pacote. Precisa de root; vale até o reboot (no WSL, até a distro reiniciar — o forge re-registra sozinho quando um RUN precisa). |
+| Runners nativos (mais rápido) | cada runner (x86, Graviton) roda `forge run . --no-push --oci out/<arch>`; um job final junta: `forge manifest out/amd64 out/arm64 --registry ecr --name api`. Imagens que reprovaram nos gates são recusadas. |
+
+Testado no WSL: imagem arm64 construída num x86, binário aarch64 executado de dentro do rootfs dela.
 
 ## Destinos
 

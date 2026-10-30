@@ -13,23 +13,32 @@ import (
 	"github.com/chwiee/forge/internal/sec"
 )
 
-// Report aggregates every stage.
+// Report aggregates every stage of every platform.
 type Report struct {
-	Version  string        `json:"forgeVersion"`
-	Started  time.Time     `json:"started"`
-	Duration string        `json:"duration"`
+	Version    string     `json:"forgeVersion"`
+	Started    time.Time  `json:"started"`
+	Duration   string     `json:"duration"`
+	Dockerfile string     `json:"dockerfile"`
+	Context    string     `json:"context"`
+	Digest     string     `json:"digest,omitempty"` // index digest when multi-platform
+	Platforms  []Platform `json:"platforms"`
+	Push       *Push      `json:"push,omitempty"`
+	Passed     bool       `json:"passed"`
+	Failures   []string   `json:"failures,omitempty"`
+}
+
+// Platform is the result for one architecture.
+type Platform struct {
+	Platform string        `json:"platform"`
 	Image    Image         `json:"image"`
 	Build    Build         `json:"build"`
 	Slim     *Slim         `json:"slim,omitempty"`
 	CVE      *scan.Report  `json:"cve,omitempty"`
 	Sec      *sec.Report   `json:"sec,omitempty"`
 	Leaks    *leaks.Report `json:"leaks,omitempty"`
-	Push     *Push         `json:"push,omitempty"`
-	Passed   bool          `json:"passed"`
-	Failures []string      `json:"failures,omitempty"`
 }
 
-// Image describes the final artifact.
+// Image describes one platform image.
 type Image struct {
 	Digest string `json:"digest,omitempty"`
 	Base   string `json:"base"`
@@ -39,12 +48,10 @@ type Image struct {
 
 // Build summarizes the build step.
 type Build struct {
-	Dockerfile string `json:"dockerfile"`
-	Context    string `json:"context"`
-	Steps      int    `json:"steps"`
-	Cached     int    `json:"cached"`
-	Isolation  string `json:"isolation,omitempty"`
-	Duration   string `json:"duration"`
+	Steps     int    `json:"steps"`
+	Cached    int    `json:"cached"`
+	Isolation string `json:"isolation,omitempty"`
+	Duration  string `json:"duration"`
 }
 
 // Slim summarizes size reduction.
@@ -61,8 +68,8 @@ type Slim struct {
 // Push records where the image went.
 type Push struct {
 	Registry string   `json:"registry"`
-	Refs     []string `json:"refs"`
-	Digest   string   `json:"digest"`
+	Refs     []string `json:"refs,omitempty"`
+	Digest   string   `json:"digest,omitempty"`
 	Skipped  string   `json:"skipped,omitempty"`
 }
 

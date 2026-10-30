@@ -14,7 +14,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -54,6 +53,11 @@ type Options struct {
 	NoCache    bool
 	Events     Events
 	Verbose    io.Writer // full RUN output when not nil
+
+	// Platform is the target platform (zero value = this machine).
+	Platform v1.Platform
+	// Emulator makes a foreign architecture runnable (RUN steps); nil = native only.
+	Emulator func(ctx context.Context, arch string) error
 }
 
 // Result is a built image plus what later pipeline stages need.
@@ -67,6 +71,7 @@ type Result struct {
 	Isolation  string
 	Ignore     *ignore.Matcher
 	Duration   time.Duration
+	Platform   v1.Platform // platform of the final image
 }
 
 type layerRec struct {
@@ -79,6 +84,7 @@ type stage struct {
 	name string
 	def  instructions.Stage
 
+	platform   v1.Platform
 	baseImg    v1.Image
 	baseRef    string
 	baseLayers int
@@ -112,7 +118,8 @@ type builder struct {
 	step     int
 	total    int
 	cached   int
-	platform v1.Platform
+	target   v1.Platform // TARGETPLATFORM
+	host     v1.Platform // BUILDPLATFORM (this machine)
 }
 
 // Build runs the whole Dockerfile and returns the target stage image.
@@ -154,10 +161,14 @@ func Build(ctx context.Context, o Options) (*Result, error) {
 		ids:      rootfs.CurrentIDMap(),
 		lex:      shell.NewLex(parsed.EscapeToken),
 		external: map[string]*stage{},
-		platform: v1.Platform{OS: "linux", Architecture: runtime.GOARCH},
+		host:     HostPlatform(),
+		target:   o.Platform,
 	}
-	if runtime.GOARCH == "arm64" {
-		b.platform.Variant = "v8"
+	if b.target.Architecture == "" {
+		b.target = b.host
+	}
+	if b.target.OS == "" {
+		b.target.OS = "linux"
 	}
 	b.meta = b.metaArgs()
 
@@ -195,6 +206,7 @@ func Build(ctx context.Context, o Options) (*Result, error) {
 		Isolation:  sandbox.LevelIfProbed(),
 		Ignore:     ig,
 		Duration:   time.Since(start),
+		Platform:   final.platform,
 	}, nil
 }
 
@@ -240,10 +252,9 @@ func (b *builder) metaArgs() map[string]string {
 }
 
 func (b *builder) platformArgs() map[string]string {
-	p := "linux/" + runtime.GOARCH
 	return map[string]string{
-		"TARGETPLATFORM": p, "TARGETOS": "linux", "TARGETARCH": runtime.GOARCH, "TARGETVARIANT": b.platform.Variant,
-		"BUILDPLATFORM": p, "BUILDOS": "linux", "BUILDARCH": runtime.GOARCH, "BUILDVARIANT": b.platform.Variant,
+		"TARGETPLATFORM": PlatformString(b.target), "TARGETOS": b.target.OS, "TARGETARCH": b.target.Architecture, "TARGETVARIANT": b.target.Variant,
+		"BUILDPLATFORM": PlatformString(b.host), "BUILDOS": b.host.OS, "BUILDARCH": b.host.Architecture, "BUILDVARIANT": b.host.Variant,
 	}
 }
 
@@ -257,10 +268,10 @@ func (b *builder) expandMeta(word string) string {
 
 // ---- base images ----
 
-func (b *builder) pull(ref string) (v1.Image, string, error) {
+func (b *builder) pull(ref string, p v1.Platform) (v1.Image, string, error) {
 	if strings.EqualFold(ref, "scratch") {
 		img, err := mutate.ConfigFile(empty.Image, &v1.ConfigFile{
-			OS: "linux", Architecture: runtime.GOARCH, Variant: b.platform.Variant,
+			OS: p.OS, Architecture: p.Architecture, Variant: p.Variant,
 			RootFS: v1.RootFS{Type: "layers"},
 		})
 		return img, "scratch", err
@@ -271,7 +282,7 @@ func (b *builder) pull(ref string) (v1.Image, string, error) {
 	}
 	img, err := remote.Image(r,
 		remote.WithContext(b.ctx),
-		remote.WithPlatform(b.platform),
+		remote.WithPlatform(p),
 		remote.WithAuthFromKeychain(registry.Keychain()),
 	)
 	if err != nil {
@@ -300,9 +311,19 @@ func (b *builder) initStage(st *stage) error {
 		st.cfg = copyConfig(parent.cfg)
 		st.key = cache.Key("FROM-STAGE", parent.key)
 		st.shell = append([]string{}, parent.shell...)
+		st.platform = parent.platform
 		return nil
 	}
-	img, resolved, err := b.pull(baseName)
+	// FROM --platform=$BUILDPLATFORM runs a stage natively (cross-compile pattern)
+	st.platform = b.target
+	if st.def.Platform != "" {
+		p, err := ParsePlatform(b.expandMeta(st.def.Platform))
+		if err != nil {
+			return fmt.Errorf("FROM --platform=%s: %w", st.def.Platform, err)
+		}
+		st.platform = p
+	}
+	img, resolved, err := b.pull(baseName, st.platform)
 	if err != nil {
 		return err
 	}
@@ -459,7 +480,7 @@ func (b *builder) image(st *stage) (v1.Image, error) {
 	cf = cf.DeepCopy()
 	cf.Config = copyConfig(st.cfg)
 	cf.Created = now
-	cf.OS, cf.Architecture, cf.Variant = "linux", runtime.GOARCH, b.platform.Variant
+	cf.OS, cf.Architecture, cf.Variant = st.platform.OS, st.platform.Architecture, st.platform.Variant
 	return mutate.ConfigFile(img, cf)
 }
 

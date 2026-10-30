@@ -19,6 +19,7 @@ Dockerfile ─► parser BuildKit (lib) ─► builder ──► slim ──► 
 | `internal/scan` | Syft (SBOM) + Grype (CVEs) como bibliotecas; banco com cache e espelho. |
 | `internal/sec` | Checagens de hardening → nota 0-100 com a correção de cada achado. |
 | `internal/leaks` | Gitleaks como biblioteca: arquivos da imagem, config/histórico e contexto. |
+| `internal/emulation` | QEMU estático (imagem fixada por digest) registrado no `binfmt_misc` para RUN de outra arquitetura. |
 | `internal/registry` | ECR (token via AWS SDK) e GHCR (`GITHUB_TOKEN`); push com progresso. |
 | `internal/dbmirror` | `forge db serve`: espelho do banco do Grype para o cluster. |
 | `internal/ui` | Spinner no terminal; linhas estáticas coloridas no CI. |
@@ -101,9 +102,18 @@ Testado (Docker Desktop simulando pods):
 Todas as etapas rodam mesmo se uma reprovar (relatório completo); o push só acontece com tudo aprovado.
 O destino é resolvido **antes** do build (credencial errada falha em segundos).
 
-## Limitações conhecidas (v0.1)
+## Multi-arch
 
-- Build só da arquitetura do host (RUN executa binários nativos). Multi-arch = um runner por arquitetura.
+- Cada stage tem sua plataforma: `FROM --platform=...` (expandido com `BUILDPLATFORM`/`TARGETPLATFORM`) ou a plataforma alvo.
+- `TARGET*` = plataforma alvo; `BUILD*` = esta máquina. A chave de cache do `FROM` é o digest da imagem daquela plataforma.
+- RUN de stage com arquitetura estrangeira chama `emulation.Ensure` **só quando erra o cache** (build 100% em cache não precisa de emulação).
+- Emulação: QEMU estático de `tonistiigi/binfmt:qemu-v10.2.3:400a4873…` (fixado por digest), registrado como `forge-qemu-<arch>` com flags `CFP` (`F` = o kernel abre o interpretador no registro, funciona dentro do chroot; `P` = preserva argv[0], sem isso o BusyBox quebra com `applet not found`). Handlers de outras ferramentas (Docker Desktop, binfmt) são reaproveitados.
+- Em pod, registrar binfmt exige `privileged`: prefira **um runner nativo por arquitetura + `forge manifest`**.
+- O OCI salvo por `forge run --oci` leva `dev.forge.gates=passed|failed`; `forge build` grava `unscanned`. `forge manifest` recusa `failed` e escaneia `unscanned` antes de publicar.
+- Índice: Docker manifest list se todas as imagens forem Docker schema 2, senão OCI image index.
+
+## Limitações conhecidas (v0.2)
+
 - `RUN --mount` (cache/secret/bind) é ignorado com aviso.
 - `ONBUILD` é ignorado.
 - `ADD` de repositório git não é suportado.

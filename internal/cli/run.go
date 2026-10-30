@@ -6,8 +6,10 @@ import (
 	"strings"
 	"time"
 
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/spf13/cobra"
 
+	"github.com/chwiee/forge/internal/builder"
 	"github.com/chwiee/forge/internal/registry"
 	"github.com/chwiee/forge/internal/report"
 	"github.com/chwiee/forge/internal/ui"
@@ -43,6 +45,13 @@ func (f *pushFlags) options() registry.Options {
 	}
 }
 
+// platformRun holds everything produced for one platform.
+type platformRun struct {
+	platform v1.Platform
+	image    v1.Image
+	rep      report.Platform
+}
+
 func newRunCmd(g *globalFlags) *cobra.Command {
 	bf := &buildFlags{}
 	gf := &gateFlags{}
@@ -52,10 +61,10 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 
 	c := &cobra.Command{
 		Use:   "run [context]",
-		Short: "Build → Slim → Scan → Sec → Leaks → Push (the whole pipeline)",
+		Short: "Build → Slim → Scan → Sec → Leaks → Push (the whole pipeline, one or many platforms)",
 		Example: `  forge run . --registry ecr --name payments-api --tag v1.4.0
-  forge run ./app --registry ghcr --name payments-api --fail-on high
-  forge run . --no-push --report out/forge.json`,
+  forge run . --registry ghcr --name api --platform linux/amd64,linux/arm64
+  forge run . --no-push --oci out/arm64     # native runner; join later with forge manifest`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -67,71 +76,113 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 			if !noPush && pf.registry == "" {
 				return fmt.Errorf("--registry ecr|ghcr is required (or use --no-push)")
 			}
+			platforms, err := builder.ParsePlatforms(bf.platforms)
+			if err != nil {
+				return err
+			}
+			multi := len(platforms) > 1
 
 			u := ui.New(g.verbose)
 			defer u.Close()
 			start := time.Now()
 			u.Banner(Version, "build · slim · scan · sec · leaks · push")
 			u.Info("context", contextDir)
+			if multi || platforms[0].Architecture != builder.HostPlatform().Architecture {
+				names := make([]string, len(platforms))
+				for i, p := range platforms {
+					names[i] = builder.PlatformString(p)
+				}
+				u.Info("platforms", u.Value(strings.Join(names, " · ")))
+			}
 			warnWindowsMount(u, contextDir, g.cacheDir)
 
-			rep := &report.Report{Version: Version, Started: start.UTC()}
+			rep := &report.Report{Version: Version, Started: start.UTC(), Context: contextDir}
 
 			// resolve the destination first: bad credentials fail in seconds, not after the build
 			var target *registry.Target
 			if !noPush {
-				var err error
 				if target, err = registry.Resolve(ctx, pf.options()); err != nil {
 					return err
 				}
 				u.Info("target", u.Value(target.String()))
 			}
-			u.Line("")
 
-			res, err := doBuild(ctx, u, g, bf, contextDir)
-			if err != nil {
-				return err
-			}
-			rep.Build = report.Build{Dockerfile: res.Parsed.Path, Context: contextDir, Steps: res.Steps, Cached: res.Cached, Isolation: res.Isolation, Duration: res.Duration.Round(time.Millisecond).String()}
+			var runs []*platformRun
+			for i, p := range platforms {
+				label := platformLabel(p, multi)
+				u.Line("")
+				if multi {
+					u.Line("  " + u.Accent("◆ "+builder.PlatformString(p)))
+				}
+				res, err := doBuild(ctx, u, g, bf, contextDir, p, label)
+				if err != nil {
+					return err
+				}
+				rep.Dockerfile = res.Parsed.Path
+				pr := &platformRun{platform: res.Platform}
+				pr.rep.Platform = builder.PlatformString(res.Platform)
+				pr.rep.Build = report.Build{Steps: res.Steps, Cached: res.Cached, Isolation: res.Isolation, Duration: res.Duration.Round(time.Millisecond).String()}
 
-			sr, err := doSlim(u, g, bf, res)
-			if err != nil {
-				return err
-			}
-			img := sr.Image
-			rep.Slim = &report.Slim{Applied: sr.Applied, Reason: sr.Reason, SizeBefore: sr.SizeBefore, SizeAfter: sr.SizeAfter, LayersBefore: sr.LayersBefore, LayersAfter: sr.LayersAfter, Removed: sr.Removed}
+				sr, err := doSlim(u, g, bf, res, label)
+				if err != nil {
+					return err
+				}
+				pr.image = sr.Image
+				pr.rep.Slim = &report.Slim{Applied: sr.Applied, Reason: sr.Reason, SizeBefore: sr.SizeBefore, SizeAfter: sr.SizeAfter, LayersBefore: sr.LayersBefore, LayersAfter: sr.LayersAfter, Removed: sr.Removed}
 
-			if rep.CVE, err = doScan(ctx, u, g, gf, img); err != nil {
-				return err
-			}
-			if rep.Sec, err = doSec(u, gf, res, img); err != nil {
-				return err
-			}
-			if rep.Leaks, err = doLeaks(ctx, u, gf, res, img, contextDir); err != nil {
-				return err
+				if pr.rep.CVE, err = doScan(ctx, u, g, gf, pr.image, label, sbomFor(gf.sbom, res.Platform, multi)); err != nil {
+					return err
+				}
+				if pr.rep.Sec, err = doSec(u, gf, res, pr.image, label); err != nil {
+					return err
+				}
+				ctxDir := ""
+				if i == 0 {
+					ctxDir = contextDir // the build context is the same for every platform
+				}
+				if pr.rep.Leaks, err = doLeaks(ctx, u, gf, res, pr.image, ctxDir, label); err != nil {
+					return err
+				}
+				dg, _ := pr.image.Digest()
+				layers, _ := pr.image.Layers()
+				pr.rep.Image = report.Image{Digest: dg.String(), Base: res.BaseRef, Size: imageSize(pr.image), Layers: len(layers)}
+				rep.Platforms = append(rep.Platforms, pr.rep)
+				runs = append(runs, pr)
 			}
 			summarize(rep)
 
-			dg, _ := img.Digest()
-			layers, _ := img.Layers()
-			rep.Image = report.Image{Digest: dg.String(), Base: res.BaseRef, Size: imageSize(img), Layers: len(layers)}
+			// what gets pushed: one image, or an index pointing at every platform
+			var art registry.Artifact = runs[0].image
+			if multi {
+				items := make([]registry.PlatformImage, len(runs))
+				for i, r := range runs {
+					items[i] = registry.PlatformImage{Image: r.image, Platform: r.platform}
+				}
+				idx, err := registry.Index(items)
+				if err != nil {
+					return err
+				}
+				art = idx
+				if d, err := idx.Digest(); err == nil {
+					rep.Digest = d.String()
+				}
+			}
 
 			if ociOut != "" {
-				if err := saveOCI(img, ociOut); err != nil {
+				if err := saveRuns(runs, ociOut, gateState(rep.Passed)); err != nil {
 					return err
 				}
 			}
 
+			u.Line("")
 			switch {
 			case noPush:
-				st := u.Start("Push")
-				st.Skip("skipped (--no-push)")
+				u.Start("Push").Skip("skipped (--no-push)")
 			case !rep.Passed:
-				st := u.Start("Push")
-				st.Fail("blocked by security gates")
+				u.Start("Push").Fail("blocked by security gates")
 				rep.Push = &report.Push{Registry: target.Kind, Skipped: "gates failed"}
 			default:
-				digest, err := doPush(ctx, u, img, target)
+				digest, err := doPush(ctx, u, art, target)
 				if err != nil {
 					return err
 				}
@@ -142,7 +193,13 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 				rep.Push = &report.Push{Registry: target.Kind, Refs: refs, Digest: digest}
 			}
 
-			printDetails(u, rep.CVE, rep.Sec, rep.Leaks)
+			for _, r := range runs {
+				title := ""
+				if multi {
+					title = r.rep.Platform
+				}
+				printDetails(u, title, r.rep.CVE, r.rep.Sec, r.rep.Leaks)
+			}
 
 			rep.Duration = time.Since(start).Round(time.Millisecond).String()
 			if err := rep.Write(reportPath); err != nil {
@@ -161,8 +218,15 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 	pf.register(c)
 	c.Flags().BoolVar(&noPush, "no-push", false, "run everything except the push")
 	c.Flags().StringVar(&reportPath, "report", ".forge/report.json", "JSON report path (empty disables)")
-	c.Flags().StringVar(&ociOut, "oci", "", "also save the final image as an OCI layout directory")
+	c.Flags().StringVar(&ociOut, "oci", "", "also save the result as an OCI layout directory (input for forge push/manifest)")
 	return c
+}
+
+func gateState(passed bool) string {
+	if passed {
+		return gatesPassed
+	}
+	return gatesFailed
 }
 
 func printSummary(u *ui.UI, rep *report.Report, target *registry.Target, d time.Duration, reportPath string) {
@@ -172,38 +236,40 @@ func printSummary(u *ui.UI, rep *report.Report, target *registry.Target, d time.
 	} else if target != nil {
 		rows = append(rows, ui.Row{Key: "image", Value: u.Muted(target.String() + " (not pushed)")})
 	}
-	rows = append(rows, ui.Row{Key: "digest", Value: u.Muted(shortDigest(rep.Image.Digest))})
-	rows = append(rows, ui.Row{Key: "base", Value: u.Muted(shortRef(rep.Image.Base))})
-	if s := rep.Slim; s != nil && s.Applied {
-		pct := 100 * float64(s.SizeBefore-s.SizeAfter) / float64(s.SizeBefore)
-		rows = append(rows, ui.Row{Key: "size", Value: fmt.Sprintf("%s → %s  %s", ui.HumanBytes(s.SizeBefore), u.Bold(ui.HumanBytes(s.SizeAfter)), u.Good(fmt.Sprintf("−%.1f%%", pct)))})
-		rows = append(rows, ui.Row{Key: "layers", Value: fmt.Sprintf("%d → %d", s.LayersBefore, s.LayersAfter)})
+	if len(rep.Platforms) == 1 {
+		p := rep.Platforms[0]
+		rows = append(rows, ui.Row{Key: "digest", Value: u.Muted(shortDigest(p.Image.Digest))})
+		rows = append(rows, ui.Row{Key: "base", Value: u.Muted(shortRef(p.Image.Base))})
+		if s := p.Slim; s != nil && s.Applied {
+			pct := 100 * float64(s.SizeBefore-s.SizeAfter) / float64(s.SizeBefore)
+			rows = append(rows, ui.Row{Key: "size", Value: fmt.Sprintf("%s → %s  %s", ui.HumanBytes(s.SizeBefore), u.Bold(ui.HumanBytes(s.SizeAfter)), u.Good(fmt.Sprintf("−%.1f%%", pct)))})
+			rows = append(rows, ui.Row{Key: "layers", Value: fmt.Sprintf("%d → %d", s.LayersBefore, s.LayersAfter)})
+		} else {
+			rows = append(rows, ui.Row{Key: "size", Value: ui.HumanBytes(p.Image.Size)})
+			rows = append(rows, ui.Row{Key: "layers", Value: fmt.Sprintf("%d", p.Image.Layers)})
+		}
+		rows = append(rows, ui.Row{Key: "cves", Value: severityLine(u, p.CVE)})
+		rows = append(rows, scoreRow(u, p))
+		rows = append(rows, secretsRow(u, p))
 	} else {
-		rows = append(rows, ui.Row{Key: "size", Value: ui.HumanBytes(rep.Image.Size)})
-		rows = append(rows, ui.Row{Key: "layers", Value: fmt.Sprintf("%d", rep.Image.Layers)})
-	}
-	rows = append(rows, ui.Row{Key: "cves", Value: severityLine(u, rep.CVE)})
-	if rep.Sec != nil {
-		sc := fmt.Sprintf("%d/100 (%s)", rep.Sec.Score, rep.Sec.Grade)
-		switch {
-		case rep.Sec.Score >= 75:
-			sc = u.Good(sc)
-		case rep.Sec.Failed:
-			sc = u.Bad(sc)
-		default:
-			sc = u.Warning(sc)
+		rows = append(rows, ui.Row{Key: "index", Value: u.Muted(shortDigest(rep.Digest))})
+		for _, p := range rep.Platforms {
+			arch := strings.TrimPrefix(p.Platform, "linux/")
+			size := ui.HumanBytes(p.Image.Size)
+			if s := p.Slim; s != nil && s.Applied {
+				size = fmt.Sprintf("%s → %s", ui.HumanBytes(s.SizeBefore), ui.HumanBytes(s.SizeAfter))
+			}
+			crit, high := 0, 0
+			if p.CVE != nil {
+				crit, high = p.CVE.Counts["Critical"], p.CVE.Counts["High"]
+			}
+			score := "—"
+			if p.Sec != nil {
+				score = fmt.Sprintf("%d", p.Sec.Score)
+			}
+			rows = append(rows, ui.Row{Key: arch, Value: fmt.Sprintf("%s · %s/%s cve · score %s",
+				u.Bold(size), colorIf(u.Bad, crit, "C"), colorIf(u.Warning, high, "H"), score)})
 		}
-		rows = append(rows, ui.Row{Key: "score", Value: sc})
-	}
-	if rep.Leaks != nil {
-		v := u.Good("none in the image")
-		if rep.Leaks.Blocking > 0 {
-			v = u.Bad(fmt.Sprintf("%d in the image", rep.Leaks.Blocking))
-		}
-		if rep.Leaks.Warnings > 0 {
-			v += u.Muted(fmt.Sprintf(" · %d in context", rep.Leaks.Warnings))
-		}
-		rows = append(rows, ui.Row{Key: "secrets", Value: v})
 	}
 	if reportPath != "" {
 		rows = append(rows, ui.Row{Key: "report", Value: u.Muted(reportPath)})
@@ -215,6 +281,36 @@ func printSummary(u *ui.UI, rep *report.Report, target *registry.Target, d time.
 	rows = append(rows, ui.Row{Key: "result", Value: verdict + u.Muted("  in "+ui.FmtDuration(d))})
 	u.Box("forge", rows)
 	u.Line("")
+}
+
+func scoreRow(u *ui.UI, p report.Platform) ui.Row {
+	if p.Sec == nil {
+		return ui.Row{Key: "score", Value: u.Muted("—")}
+	}
+	sc := fmt.Sprintf("%d/100 (%s)", p.Sec.Score, p.Sec.Grade)
+	switch {
+	case p.Sec.Score >= 75:
+		sc = u.Good(sc)
+	case p.Sec.Failed:
+		sc = u.Bad(sc)
+	default:
+		sc = u.Warning(sc)
+	}
+	return ui.Row{Key: "score", Value: sc}
+}
+
+func secretsRow(u *ui.UI, p report.Platform) ui.Row {
+	if p.Leaks == nil {
+		return ui.Row{Key: "secrets", Value: u.Muted("—")}
+	}
+	v := u.Good("none in the image")
+	if p.Leaks.Blocking > 0 {
+		v = u.Bad(fmt.Sprintf("%d in the image", p.Leaks.Blocking))
+	}
+	if p.Leaks.Warnings > 0 {
+		v += u.Muted(fmt.Sprintf(" · %d in context", p.Leaks.Warnings))
+	}
+	return ui.Row{Key: "secrets", Value: v}
 }
 
 func shortDigest(d string) string {

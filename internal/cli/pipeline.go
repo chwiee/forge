@@ -11,10 +11,12 @@ import (
 	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/spf13/cobra"
 
 	"github.com/chwiee/forge/internal/builder"
 	"github.com/chwiee/forge/internal/cache"
+	"github.com/chwiee/forge/internal/emulation"
 	"github.com/chwiee/forge/internal/leaks"
 	"github.com/chwiee/forge/internal/registry"
 	"github.com/chwiee/forge/internal/report"
@@ -33,6 +35,8 @@ type buildFlags struct {
 	noCache   bool
 	slim      string
 	squash    string
+	platforms string
+	noEmulate bool
 }
 
 func (f *buildFlags) register(c *cobra.Command) {
@@ -42,6 +46,8 @@ func (f *buildFlags) register(c *cobra.Command) {
 	c.Flags().BoolVar(&f.noCache, "no-cache", false, "do not reuse cached steps")
 	c.Flags().StringVar(&f.slim, "slim", slim.Safe, "cleanup profile: off | safe | aggressive")
 	c.Flags().StringVar(&f.squash, "squash", slim.SquashApp, "layer squash: app (Dockerfile layers) | all | off")
+	c.Flags().StringVar(&f.platforms, "platform", os.Getenv("FORGE_PLATFORM"), "target platforms, comma separated (e.g. linux/amd64,linux/arm64; default: this machine) [$FORGE_PLATFORM]")
+	c.Flags().BoolVar(&f.noEmulate, "no-emulation", false, "never enable QEMU emulation: RUN steps of a foreign architecture fail instead")
 }
 
 // gateFlags configure the security gates.
@@ -61,7 +67,7 @@ func (f *gateFlags) register(c *cobra.Command) {
 	c.Flags().IntVar(&f.minScore, "min-score", 50, "hardening gate: minimum score 0-100 (0 disables)")
 	c.Flags().StringSliceVar(&f.ignoreCVE, "ignore-cve", nil, "CVE/GHSA ids accepted by the team (comma separated)")
 	c.Flags().StringVar(&f.dbURL, "db-url", os.Getenv("FORGE_DB_URL"), "vulnerability DB mirror, e.g. http://forge-db.forge.svc:8080/databases [$FORGE_DB_URL]")
-	c.Flags().StringVar(&f.sbom, "sbom", "", "write the SBOM (CycloneDX JSON) to this file")
+	c.Flags().StringVar(&f.sbom, "sbom", "", "write the SBOM (CycloneDX JSON) to this file (multi-platform: one file per platform)")
 	c.Flags().BoolVar(&f.failOnContext, "leaks-fail-on-context", false, "secrets found in the build context also block (default: only what ships in the image)")
 }
 
@@ -75,6 +81,18 @@ func parseBuildArgs(in []string) map[string]string {
 		m[k] = v
 	}
 	return m
+}
+
+// platformLabel is " arm64" style suffix for step names when building several platforms.
+func platformLabel(p v1.Platform, multi bool) string {
+	if !multi {
+		return ""
+	}
+	s := p.Architecture
+	if p.Variant != "" {
+		s += "/" + p.Variant
+	}
+	return " " + s
 }
 
 // ---- build ----
@@ -120,8 +138,22 @@ func clip(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-func doBuild(ctx context.Context, u *ui.UI, g *globalFlags, f *buildFlags, contextDir string) (*builder.Result, error) {
-	st := u.Start("Build")
+func emulator(u *ui.UI, g *globalFlags, f *buildFlags) func(context.Context, string) error {
+	if f.noEmulate {
+		return nil
+	}
+	m := &emulation.Manager{
+		CacheDir: g.cacheDir,
+		Keychain: remote.WithAuthFromKeychain(registry.Keychain()),
+		OnInstall: func(arch string) {
+			u.Line("    " + u.Accent("⚙") + " " + u.Muted("enabled "+arch+" emulation (QEMU via binfmt_misc, until reboot)"))
+		},
+	}
+	return m.Ensure
+}
+
+func doBuild(ctx context.Context, u *ui.UI, g *globalFlags, f *buildFlags, contextDir string, p v1.Platform, label string) (*builder.Result, error) {
+	st := u.Start("Build" + label)
 	ev := &buildEvents{u: u, step: st}
 	opts := builder.Options{
 		ContextDir: contextDir,
@@ -131,6 +163,8 @@ func doBuild(ctx context.Context, u *ui.UI, g *globalFlags, f *buildFlags, conte
 		CacheDir:   g.cacheDir,
 		NoCache:    f.noCache,
 		Events:     ev,
+		Platform:   p,
+		Emulator:   emulator(u, g, f),
 	}
 	if u.Verbose() {
 		opts.Verbose = os.Stderr
@@ -158,8 +192,10 @@ func doBuild(ctx context.Context, u *ui.UI, g *globalFlags, f *buildFlags, conte
 		return nil, err
 	}
 	layers, _ := res.Image.Layers()
-	size := imageSize(res.Image)
-	msg := fmt.Sprintf("%d steps · %d cached · %d layers · %s", res.Steps, res.Cached, len(layers), ui.HumanBytes(size))
+	msg := fmt.Sprintf("%d steps · %d cached · %d layers · %s", res.Steps, res.Cached, len(layers), ui.HumanBytes(imageSize(res.Image)))
+	if label != "" {
+		msg += " · " + builder.PlatformString(res.Platform)
+	}
 	st.Done(msg)
 	return res, nil
 }
@@ -180,13 +216,16 @@ func imageSize(img v1.Image) int64 {
 
 // ---- slim ----
 
-func doSlim(u *ui.UI, g *globalFlags, f *buildFlags, res *builder.Result) (*slim.Result, error) {
-	st := u.Start("Slim")
-	if f.slim == slim.Off && f.squash == slim.SquashOff {
-		st.Skip("disabled")
+func doSlim(u *ui.UI, g *globalFlags, f *buildFlags, res *builder.Result, label string) (*slim.Result, error) {
+	st := u.Start("Slim" + label)
+	keep := func(reason string) *slim.Result {
 		layers, _ := res.Image.Layers()
 		s := imageSize(res.Image)
-		return &slim.Result{Image: res.Image, SizeBefore: s, SizeAfter: s, LayersBefore: len(layers), LayersAfter: len(layers), Reason: "disabled"}, nil
+		return &slim.Result{Image: res.Image, SizeBefore: s, SizeAfter: s, LayersBefore: len(layers), LayersAfter: len(layers), Reason: reason}
+	}
+	if f.slim == slim.Off && f.squash == slim.SquashOff {
+		st.Skip("disabled")
+		return keep("disabled"), nil
 	}
 	st.Detail("squashing Dockerfile layers, removing build leftovers", false)
 	store, err := cache.Open(filepath.Join(g.cacheDir, "layers"))
@@ -197,9 +236,7 @@ func doSlim(u *ui.UI, g *globalFlags, f *buildFlags, res *builder.Result) (*slim
 	if err != nil {
 		st.Fail("failed — keeping original image")
 		u.Warn(err.Error())
-		layers, _ := res.Image.Layers()
-		s := imageSize(res.Image)
-		return &slim.Result{Image: res.Image, SizeBefore: s, SizeAfter: s, LayersBefore: len(layers), LayersAfter: len(layers), Reason: err.Error()}, nil
+		return keep(err.Error()), nil
 	}
 	if !r.Applied {
 		st.Skip(r.Reason)
@@ -221,14 +258,14 @@ func doSlim(u *ui.UI, g *globalFlags, f *buildFlags, res *builder.Result) (*slim
 
 // ---- scan ----
 
-func doScan(ctx context.Context, u *ui.UI, g *globalFlags, gf *gateFlags, img v1.Image) (*scan.Report, error) {
-	st := u.Start("Scan")
+func doScan(ctx context.Context, u *ui.UI, g *globalFlags, gf *gateFlags, img v1.Image, label, sbomPath string) (*scan.Report, error) {
+	st := u.Start("Scan" + label)
 	st.Detail("loading vulnerability database", false)
 	work := filepath.Join(g.cacheDir, "work")
 	_ = os.MkdirAll(work, 0o755)
 	r, err := scan.Image(ctx, img, work, scan.Options{
 		CacheDir: g.cacheDir, DBURL: gf.dbURL, FailOn: gf.failOn, OnlyFixed: gf.onlyFixed,
-		Ignore: gf.ignoreCVE, SBOMPath: gf.sbom, Version: Version,
+		Ignore: gf.ignoreCVE, SBOMPath: sbomPath, Version: Version,
 		OnDB: func(m string) { st.Detail(m, false) },
 	})
 	if err != nil {
@@ -262,10 +299,28 @@ func doScan(ctx context.Context, u *ui.UI, g *globalFlags, gf *gateFlags, img v1
 	return r, nil
 }
 
+// sbomFor returns the SBOM path for one platform ("sbom.cdx.json" -> "sbom.arm64.cdx.json").
+func sbomFor(base string, p v1.Platform, multi bool) string {
+	if base == "" || !multi {
+		return base
+	}
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	if e2 := filepath.Ext(stem); e2 != "" {
+		ext = e2 + ext
+		stem = strings.TrimSuffix(stem, e2)
+	}
+	tag := p.Architecture
+	if p.Variant != "" {
+		tag += p.Variant
+	}
+	return stem + "." + tag + ext
+}
+
 // ---- sec ----
 
-func doSec(u *ui.UI, gf *gateFlags, res *builder.Result, img v1.Image) (*sec.Report, error) {
-	st := u.Start("Sec")
+func doSec(u *ui.UI, gf *gateFlags, res *builder.Result, img v1.Image, label string) (*sec.Report, error) {
+	st := u.Start("Sec" + label)
 	cf, err := img.ConfigFile()
 	if err != nil {
 		return nil, err
@@ -297,8 +352,9 @@ func appLayers(img v1.Image, base int) []v1.Layer {
 
 // ---- leaks ----
 
-func doLeaks(ctx context.Context, u *ui.UI, gf *gateFlags, res *builder.Result, img v1.Image, contextDir string) (*leaks.Report, error) {
-	st := u.Start("Leaks")
+// doLeaks scans the image; contextDir is scanned only when non-empty (once per run).
+func doLeaks(ctx context.Context, u *ui.UI, gf *gateFlags, res *builder.Result, img v1.Image, contextDir, label string) (*leaks.Report, error) {
+	st := u.Start("Leaks" + label)
 	st.Detail("scanning image files, config and build context", false)
 	cf, err := img.ConfigFile()
 	if err != nil {
@@ -325,11 +381,11 @@ func doLeaks(ctx context.Context, u *ui.UI, gf *gateFlags, res *builder.Result, 
 
 // ---- push ----
 
-func doPush(ctx context.Context, u *ui.UI, img v1.Image, t *registry.Target) (string, error) {
+func doPush(ctx context.Context, u *ui.UI, art registry.Artifact, t *registry.Target) (string, error) {
 	st := u.Start("Push")
 	st.Detail(t.String(), false)
 	st.Progress(0)
-	dg, err := registry.Push(ctx, img, t, func(done, total int64) {
+	dg, err := registry.Push(ctx, art, t, func(done, total int64) {
 		st.Progress(int(done * 100 / total))
 		st.Detail(fmt.Sprintf("%s / %s", ui.HumanBytes(done), ui.HumanBytes(total)), false)
 	})
@@ -338,13 +394,23 @@ func doPush(ctx context.Context, u *ui.UI, img v1.Image, t *registry.Target) (st
 		st.Fail("failed")
 		return "", err
 	}
-	st.Done(t.String())
+	msg := t.String()
+	if idx, ok := art.(v1.ImageIndex); ok {
+		if m, err := idx.IndexManifest(); err == nil {
+			msg += fmt.Sprintf("  (%d platforms)", len(m.Manifests))
+		}
+	}
+	st.Done(msg)
 	return dg.String(), nil
 }
 
 // ---- details ----
 
-func printDetails(u *ui.UI, cve *scan.Report, s *sec.Report, lk *leaks.Report) {
+func printDetails(u *ui.UI, title string, cve *scan.Report, s *sec.Report, lk *leaks.Report) {
+	if title != "" && (cve != nil && len(cve.Vulns) > 0 || s != nil && len(s.Findings) > 0 || lk != nil && len(lk.Findings) > 0) {
+		u.Line("")
+		u.Line("  " + u.Accent("◆ "+title))
+	}
 	if cve != nil && len(cve.Vulns) > 0 {
 		var rows [][]string
 		for _, v := range cve.Vulns {
@@ -442,15 +508,23 @@ func colorIf(c func(string) string, n int, label string) string {
 	return s
 }
 
+// summarize collects gate failures of every platform.
 func summarize(rep *report.Report) {
-	if rep.CVE != nil && rep.CVE.Failed {
-		rep.Failures = append(rep.Failures, "cve: "+rep.CVE.Reason)
-	}
-	if rep.Sec != nil && rep.Sec.Failed {
-		rep.Failures = append(rep.Failures, "sec: "+rep.Sec.Reason)
-	}
-	if rep.Leaks != nil && rep.Leaks.Failed {
-		rep.Failures = append(rep.Failures, "leaks: "+rep.Leaks.Reason)
+	multi := len(rep.Platforms) > 1
+	for _, p := range rep.Platforms {
+		pre := ""
+		if multi {
+			pre = p.Platform + " "
+		}
+		if p.CVE != nil && p.CVE.Failed {
+			rep.Failures = append(rep.Failures, pre+"cve: "+p.CVE.Reason)
+		}
+		if p.Sec != nil && p.Sec.Failed {
+			rep.Failures = append(rep.Failures, pre+"sec: "+p.Sec.Reason)
+		}
+		if p.Leaks != nil && p.Leaks.Failed {
+			rep.Failures = append(rep.Failures, pre+"leaks: "+p.Leaks.Reason)
+		}
 	}
 	rep.Passed = len(rep.Failures) == 0
 }

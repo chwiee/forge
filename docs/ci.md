@@ -93,3 +93,31 @@ Use uma distro Linux (Ubuntu), **não** a `docker-desktop`, e trabalhe no filesy
 sudo forge run . --no-push        # tudo menos o push
 forge doctor                      # mostra o nível de isolamento disponível
 ```
+
+## Multi-arch no CI
+
+**Opção 1 — um job, emulação** (simples; RUN emulados são mais lentos; precisa de root com `binfmt_misc` gravável — `sudo` no runner hospedado do GitHub, pod `privileged` no Kubernetes):
+
+```bash
+sudo -E forge run . --registry ghcr --name api --platform linux/amd64,linux/arm64
+```
+
+**Opção 2 — runners nativos + manifest** (rápido; sem privilégios; recomendado no EKS com nós Graviton):
+
+```yaml
+# GitLab: dois jobs em runners com tags diferentes + um job que junta
+build-amd64:
+  tags: [k8s-amd64]
+  script: [forge run . --no-push --oci out/amd64]
+  artifacts: {paths: [out/amd64, .forge/report.json]}
+build-arm64:
+  tags: [k8s-arm64]
+  script: [forge run . --no-push --oci out/arm64]
+  artifacts: {paths: [out/arm64]}
+publish:
+  needs: [build-amd64, build-arm64]
+  script:
+    - forge manifest out/amd64 out/arm64 --registry ecr --name $CI_PROJECT_PATH_SLUG --tag $CI_COMMIT_SHORT_SHA
+```
+
+Cada `forge run` já aplicou os gates; o `forge manifest` recusa qualquer pasta marcada como reprovada.

@@ -219,7 +219,7 @@ func (b *builder) fromStage(ref string) (*stage, error) {
 	if st, ok := b.external[ref]; ok {
 		return st, nil
 	}
-	img, resolved, err := b.pull(ref)
+	img, resolved, err := b.pull(ref, b.target)
 	if err != nil {
 		return nil, err
 	}

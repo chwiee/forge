@@ -54,7 +54,7 @@ leaked secrets (Gitleaks) and pushes to ECR or GHCR — in one binary.`,
 	root.PersistentFlags().BoolVarP(&g.verbose, "verbose", "v", false, "stream full RUN output")
 	root.PersistentFlags().StringVar(&g.cacheDir, "cache-dir", defaultCacheDir(), "layer/image/DB cache (mount a volume here in CI) [$FORGE_CACHE_DIR]")
 
-	root.AddCommand(newRunCmd(g), newBuildCmd(g), newScanCmd(g), newPushCmd(g), newDBCmd(g), newCacheCmd(g), newDoctorCmd(g), newVersionCmd())
+	root.AddCommand(newRunCmd(g), newBuildCmd(g), newScanCmd(g), newPushCmd(g), newDBCmd(g), newCacheCmd(g), newDoctorCmd(g), newEmulationCmd(g), newVersionCmd())
 
 	err := root.ExecuteContext(ctx)
 	if err == nil {

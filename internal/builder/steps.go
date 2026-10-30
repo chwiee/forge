@@ -18,6 +18,7 @@ import (
 
 	"github.com/chwiee/forge/internal/cache"
 	"github.com/chwiee/forge/internal/dockerfile"
+	"github.com/chwiee/forge/internal/emulation"
 	"github.com/chwiee/forge/internal/sandbox"
 )
 
@@ -290,6 +291,15 @@ func (b *builder) run(st *stage, c *instructions.RunCommand, text string) (bool,
 	key := cache.Key(st.key, "RUN", strings.Join(argv, "\x00"), strings.Join(env, "\n"), st.cfg.User, workdirOf(st), stdin, scriptData)
 
 	return b.fsStep(st, key, text, func(root string) error {
+		if !emulation.Native(st.platform) {
+			if b.opts.Emulator == nil {
+				return fmt.Errorf("RUN for %s needs emulation on this %s machine: enable it (default) or build on a native %s runner and join with `forge manifest`",
+					PlatformString(st.platform), HostPlatform().Architecture, st.platform.Architecture)
+			}
+			if err := b.opts.Emulator(b.ctx, st.platform.Architecture); err != nil {
+				return err
+			}
+		}
 		uid, gid, groups := 0, 0, []int(nil)
 		if st.cfg.User != "" {
 			u, err := resolveUser(root, st.cfg.User)

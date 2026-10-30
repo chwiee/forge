@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -20,7 +21,11 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
 // Kinds supported for push.
@@ -288,8 +293,14 @@ func Keychain() authn.Keychain { return keychain }
 
 var keychain = authn.NewMultiKeychain(&ecrKeychain{}, ghcrKeychain{}, authn.DefaultKeychain)
 
-// Push uploads img to every tag of t. progress receives (complete, total) bytes.
-func Push(ctx context.Context, img v1.Image, t *Target, progress func(done, total int64)) (v1.Hash, error) {
+// Artifact is what can be pushed: a v1.Image or a v1.ImageIndex (multi-arch).
+type Artifact interface {
+	remote.Taggable
+	Digest() (v1.Hash, error)
+}
+
+// Push uploads art to every tag of t. progress receives (complete, total) bytes.
+func Push(ctx context.Context, art Artifact, t *Target, progress func(done, total int64)) (v1.Hash, error) {
 	updates := make(chan v1.Update, 64)
 	done := make(chan struct{})
 	go func() {
@@ -301,15 +312,75 @@ func Push(ctx context.Context, img v1.Image, t *Target, progress func(done, tota
 		}
 	}()
 	opts := []remote.Option{remote.WithContext(ctx), remote.WithAuthFromKeychain(Keychain()), remote.WithProgress(updates), remote.WithJobs(4)}
-	err := remote.Write(t.Ref(0), img, opts...)
+	var err error
+	switch a := art.(type) {
+	case v1.ImageIndex:
+		err = remote.WriteIndex(t.Ref(0), a, opts...)
+	case v1.Image:
+		err = remote.Write(t.Ref(0), a, opts...)
+	default:
+		close(updates)
+		err = fmt.Errorf("cannot push %T", art)
+	}
 	<-done
 	if err != nil {
-		return v1.Hash{}, err
+		return v1.Hash{}, explain(t, err)
 	}
 	for i := 1; i < len(t.Tags); i++ {
-		if err := remote.Tag(t.Ref(i), img, remote.WithContext(ctx), remote.WithAuthFromKeychain(Keychain())); err != nil {
+		if err := remote.Tag(t.Ref(i), art, remote.WithContext(ctx), remote.WithAuthFromKeychain(Keychain())); err != nil {
 			return v1.Hash{}, fmt.Errorf("tag %s: %w", t.Tags[i], err)
 		}
 	}
-	return img.Digest()
+	return art.Digest()
+}
+
+// PlatformImage is one entry of a multi-arch index.
+type PlatformImage struct {
+	Image    v1.Image
+	Platform v1.Platform
+}
+
+// Index builds a multi-platform index. Docker manifest list when every image is
+// Docker schema 2 (widest compatibility), OCI image index otherwise.
+func Index(items []PlatformImage) (v1.ImageIndex, error) {
+	if len(items) == 0 {
+		return nil, fmt.Errorf("no images for the index")
+	}
+	allDocker := true
+	for _, it := range items {
+		if mt, err := it.Image.MediaType(); err != nil || mt != types.DockerManifestSchema2 {
+			allDocker = false
+		}
+	}
+	idx := mutate.IndexMediaType(empty.Index, types.OCIImageIndex)
+	if allDocker {
+		idx = mutate.IndexMediaType(empty.Index, types.DockerManifestList)
+	}
+	adds := make([]mutate.IndexAddendum, 0, len(items))
+	for _, it := range items {
+		p := it.Platform
+		mt, err := it.Image.MediaType()
+		if err != nil {
+			return nil, err
+		}
+		adds = append(adds, mutate.IndexAddendum{Add: it.Image, Descriptor: v1.Descriptor{MediaType: mt, Platform: &p}})
+	}
+	return mutate.AppendManifests(idx, adds...), nil
+}
+
+// explain turns registry auth failures into an actionable message.
+func explain(t *Target, err error) error {
+	var te *transport.Error
+	denied := errors.As(err, &te) && (te.StatusCode == http.StatusUnauthorized || te.StatusCode == http.StatusForbidden)
+	msg := err.Error()
+	if !denied && !strings.Contains(msg, "DENIED") && !strings.Contains(msg, "UNAUTHORIZED") {
+		return err
+	}
+	switch t.Kind {
+	case GHCR:
+		return fmt.Errorf("ghcr: push to %s denied — set GITHUB_TOKEN (job permission packages: write) or GHCR_TOKEN (PAT with write:packages) and make sure the owner %q is right", t.Repo, t.Repo.RepositoryStr())
+	case ECR:
+		return fmt.Errorf("ecr: push to %s denied — refresh credentials (`aws login`), and check ecr:InitiateLayerUpload/PutImage permissions and that the repository exists (--create-repo)", t.Repo)
+	}
+	return err
 }

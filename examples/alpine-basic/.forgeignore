@@ -1,0 +1,5 @@
+# never ship local secrets or editor junk
+.env
+*.log
+.forgeignore
+Dockerfile

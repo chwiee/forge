@@ -1,0 +1,5 @@
+server:
+  port: 8080
+github:
+  # fake token used to prove the Leaks gate blocks the push
+  token: ghp_Zq3vT9kLm2Xw8RbN4cYp7HsJd1FgA6eU0iQo

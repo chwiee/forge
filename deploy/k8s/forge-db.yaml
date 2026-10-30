@@ -1,0 +1,65 @@
+# Grype vulnerability DB mirror for forge runners.
+# Runners use: FORGE_DB_URL=http://forge-db.forge.svc.cluster.local:8080/databases
+#
+# One Deployment: `forge db serve` downloads the DB at start and every 24h and
+# serves it over HTTP (same layout as grype.anchore.io). No CronJob/RWX volume needed.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: forge
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge-db
+  namespace: forge
+  labels: {app: forge-db}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: forge-db}
+  template:
+    metadata:
+      labels: {app: forge-db}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: forge-db
+          image: ghcr.io/chwiee/forge:latest
+          args: ["db", "serve", "--dir", "/data/grype", "--addr", ":8080", "--sync-every", "24h"]
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        # emptyDir is enough: the pod re-downloads on restart (~200 MB).
+        # Swap for a PVC to survive restarts without internet.
+        - name: data
+          emptyDir: {sizeLimit: 2Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: forge-db
+  namespace: forge
+spec:
+  selector: {app: forge-db}
+  ports:
+    - {name: http, port: 8080, targetPort: http}

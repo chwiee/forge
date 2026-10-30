@@ -1,0 +1,43 @@
+# Example: a CI job pod running forge (GitLab runner / Azure DevOps agent / ARC
+# use the same securityContext in their pod templates).
+#
+# forge needs NO privileged mode and NO extra capabilities:
+#   - runs as root inside the pod (uid 0 is mapped through a user namespace)
+#   - seccomp Unconfined so the pod may create a user namespace
+#   - on Ubuntu nodes with AppArmor, also set appArmorProfile Unconfined
+# `forge doctor` prints which isolation level the pod got.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: forge-job
+  namespace: ci
+spec:
+  restartPolicy: Never
+  serviceAccountName: forge-ci   # with Pod Identity / IRSA for ECR push
+  containers:
+    - name: forge
+      image: ghcr.io/chwiee/forge:latest
+      workingDir: /workspace
+      command: ["forge", "run", ".", "--registry", "ecr", "--name", "team/app", "--create-repo"]
+      env:
+        - {name: FORGE_DB_URL, value: "http://forge-db.forge.svc.cluster.local:8080/databases"}
+        - {name: FORGE_CACHE_DIR, value: /cache}
+        - {name: AWS_REGION, value: us-east-2}
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: true
+        seccompProfile: {type: Unconfined}
+        # appArmorProfile: {type: Unconfined}   # Ubuntu nodes only
+      resources:
+        requests: {cpu: "1", memory: 2Gi}
+        limits: {memory: 6Gi}
+      volumeMounts:
+        - {name: workspace, mountPath: /workspace}
+        - {name: cache, mountPath: /cache}
+  volumes:
+    - name: workspace
+      emptyDir: {}
+    # persistent cache = reused layers + base images + warm vulnerability DB
+    - name: cache
+      persistentVolumeClaim:
+        claimName: forge-cache

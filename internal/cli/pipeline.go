@@ -247,6 +247,9 @@ func doSlim(u *ui.UI, g *globalFlags, f *buildFlags, res *builder.Result, label 
 	}
 	pct := 100 * float64(r.SizeBefore-r.SizeAfter) / float64(r.SizeBefore)
 	msg := fmt.Sprintf("%s → %s  (−%.1f%%) · %d → %d layers", ui.HumanBytes(r.SizeBefore), ui.HumanBytes(r.SizeAfter), pct, r.LayersBefore, r.LayersAfter)
+	if pct < 0.1 {
+		msg = fmt.Sprintf("size unchanged · %d → %d layers", r.LayersBefore, r.LayersAfter)
+	}
 	if r.Cached {
 		msg += " · cached"
 	}
@@ -385,7 +388,7 @@ func doLeaks(ctx context.Context, u *ui.UI, gf *gateFlags, res *builder.Result, 
 	case r.Failed:
 		st.Fail(fmt.Sprintf("%d secret(s) in the image · %d in context", r.Blocking, r.Warnings))
 	case r.Warnings > 0:
-		st.Warn(fmt.Sprintf("no secrets in the image · %d in build context (not shipped)", r.Warnings))
+		st.Warn(fmt.Sprintf("no secrets in the image · %d in the build context", r.Warnings))
 	default:
 		st.Done(fmt.Sprintf("no secrets · %d files checked", r.Scanned))
 	}

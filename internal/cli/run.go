@@ -140,7 +140,8 @@ the remaining builds and blocks the push; --fail-fast cancels at once.`,
 			u.Line("")
 			u.SetConcurrent(multi)
 
-			rep := &report.Report{Version: Version, Started: start.UTC(), Context: contextDir, Dockerfile: bf.file}
+			rep := &report.Report{Version: Version, Started: start.UTC(), Context: contextDir, Dockerfile: bf.file,
+				Gates: report.GateConfig{FailOn: gf.failOn, OnlyFixed: gf.onlyFixed, MinScore: gf.minScore}}
 			if rep.Dockerfile == "" {
 				rep.Dockerfile = filepath.Join(contextDir, "Dockerfile")
 			}
@@ -220,7 +221,7 @@ the remaining builds and blocks the push; --fail-fast cancels at once.`,
 				case r.Failed:
 					st.Fail(fmt.Sprintf("%d secret(s) in the build context", len(r.Findings)))
 				case len(r.Findings) > 0:
-					st.Warn(fmt.Sprintf("%d secret(s) in the build context (not shipped)", len(r.Findings)))
+					st.Warn(fmt.Sprintf("%d secret(s) in the build context — Leaks checks what ships in the image", len(r.Findings)))
 				default:
 					st.Done(fmt.Sprintf("no secrets · %d files", r.Scanned))
 				}
@@ -454,6 +455,7 @@ func printSummary(u *ui.UI, rep *report.Report, target *registry.Target, d time.
 		rows = append(rows, ui.Row{Key: "cves", Value: severityLine(u, p.CVE)})
 		rows = append(rows, scoreRow(u, p))
 		rows = append(rows, secretsRow(u, p))
+		rows = append(rows, ui.Row{Key: "gates", Value: gatesLine(u, p, rep.Gates)})
 	} else {
 		if rep.Digest != "" {
 			rows = append(rows, ui.Row{Key: "index", Value: u.Muted(shortDigest(rep.Digest))})
@@ -482,11 +484,15 @@ func printSummary(u *ui.UI, rep *report.Report, target *registry.Target, d time.
 	if reportPath != "" {
 		rows = append(rows, ui.Row{Key: "report", Value: u.Muted(reportPath)})
 	}
-	verdict := u.Good("✔ passed")
-	if !rep.Passed {
-		verdict = u.Bad("✖ " + strings.Join(rep.Failures, " · "))
+	if rep.Passed {
+		rows = append(rows, ui.Row{Key: "result", Value: u.Good("✔ passed") + u.Muted("  in "+ui.FmtDuration(d))})
+	} else {
+		// one line per failure: long reasons must never be cut
+		rows = append(rows, ui.Row{Key: "result", Value: u.Bad(fmt.Sprintf("✖ blocked — %d check(s) failed", len(rep.Failures))) + u.Muted("  in "+ui.FmtDuration(d))})
+		for _, f := range rep.Failures {
+			rows = append(rows, ui.Row{Key: "", Value: u.Bad("↳ " + f)})
+		}
 	}
-	rows = append(rows, ui.Row{Key: "result", Value: verdict + u.Muted("  in "+ui.FmtDuration(d))})
 	u.Box("forge", rows)
 	u.Line("")
 }
@@ -533,4 +539,48 @@ func shortRef(r string) string {
 		return r[:i+20] + "…"
 	}
 	return r
+}
+
+// gatesLine shows each gate with its verdict and the threshold applied, so a
+// "passed" next to critical CVEs explains itself (none of them has a fix yet).
+func gatesLine(u *ui.UI, p report.Platform, g report.GateConfig) string {
+	mark := func(ok bool) string {
+		if ok {
+			return u.Good("✔")
+		}
+		return u.Bad("✖")
+	}
+	var parts []string
+	if p.CVE != nil {
+		n := 0
+		if !strings.EqualFold(g.FailOn, "none") {
+			limit := scan.Rank(normSev(g.FailOn))
+			for _, v := range p.CVE.Vulns {
+				if scan.Rank(v.Severity) <= limit && (!g.OnlyFixed || v.FixedIn != "") {
+					n++
+				}
+			}
+		}
+		what := "≥ " + strings.ToLower(g.FailOn)
+		if g.OnlyFixed {
+			what += " with fix"
+		}
+		parts = append(parts, fmt.Sprintf("cve %s %d %s", mark(!p.CVE.Failed), n, u.Muted(what)))
+	}
+	if p.Sec != nil {
+		parts = append(parts, fmt.Sprintf("sec %s %d %s", mark(!p.Sec.Failed), p.Sec.Score, u.Muted(fmt.Sprintf("≥ %d", g.MinScore))))
+	}
+	if p.Leaks != nil {
+		parts = append(parts, fmt.Sprintf("leaks %s %d %s", mark(!p.Leaks.Failed), p.Leaks.Blocking, u.Muted("in image")))
+	}
+	return strings.Join(parts, u.Muted(" · "))
+}
+
+func normSev(s string) string {
+	for _, sev := range scan.Severities {
+		if strings.EqualFold(s, sev) {
+			return sev
+		}
+	}
+	return "Critical"
 }

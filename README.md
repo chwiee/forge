@@ -156,6 +156,7 @@ make test
 
 ## Documentação
 
+- [**Uso: etapas, validações, retorno e saídas reais**](docs/uso.md)
 - [Arquitetura, cache, isolamento, slim e gates](docs/arquitetura.md)
 - [Uso no CI: GitLab, Azure DevOps, GitHub Actions, WSL](docs/ci.md)
 - [Exemplos](examples/) — `alpine-basic` (passa) e `go-multistage` (reprova de propósito: CVE + segredo)

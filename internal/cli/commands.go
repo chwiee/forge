@@ -188,10 +188,17 @@ func newDoctorCmd(g *globalFlags) *cobra.Command {
 			} else {
 				warn("ghcr", "no GHCR_TOKEN/GITHUB_TOKEN (docker config.json is used if present)")
 			}
-			if os.Getenv("AWS_REGION") != "" || os.Getenv("AWS_PROFILE") != "" || os.Getenv("AWS_ROLE_ARN") != "" || os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != "" {
-				ok("ecr", "AWS environment detected")
-			} else {
-				warn("ecr", "no AWS env vars (instance/pod identity or ~/.aws may still work)")
+			home, _ := os.UserHomeDir()
+			_, awsDirErr := os.Stat(filepath.Join(home, ".aws", "config"))
+			switch {
+			case os.Getenv("AWS_ROLE_ARN") != "" || os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != "":
+				ok("ecr", "workload identity (IRSA / Pod Identity) detected")
+			case os.Getenv("AWS_PROFILE") != "" || os.Getenv("AWS_REGION") != "":
+				ok("ecr", "AWS environment detected (profile "+envOr("AWS_PROFILE", "default")+")")
+			case awsDirErr == nil:
+				ok("ecr", "~/.aws/config found (set AWS_PROFILE to pick a profile)")
+			default:
+				warn("ecr", "no AWS credentials found (aws login, ~/.aws, or IRSA/Pod Identity in CI)")
 			}
 			u.Line("")
 			return nil

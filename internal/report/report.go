@@ -26,9 +26,18 @@ type Report struct {
 	ContextLeaks *leaks.Report `json:"contextLeaks,omitempty"`
 	// Cancelled lists platforms whose build was stopped (gate failure elsewhere).
 	Cancelled []string `json:"cancelled,omitempty"`
-	Push      *Push    `json:"push,omitempty"`
-	Passed    bool     `json:"passed"`
-	Failures  []string `json:"failures,omitempty"`
+	// Gates records the thresholds this run was judged against.
+	Gates    GateConfig `json:"gates"`
+	Push     *Push      `json:"push,omitempty"`
+	Passed   bool       `json:"passed"`
+	Failures []string   `json:"failures,omitempty"`
+}
+
+// GateConfig is the policy applied by the gates.
+type GateConfig struct {
+	FailOn    string `json:"cveFailOn"`
+	OnlyFixed bool   `json:"cveOnlyFixed"`
+	MinScore  int    `json:"minScore"`
 }
 
 // Platform is the result for one architecture.

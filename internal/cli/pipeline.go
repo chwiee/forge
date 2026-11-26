@@ -36,7 +36,7 @@ type buildFlags struct {
 	slim      string
 	squash    string
 	platforms string
-	noEmulate bool
+	emulate   bool
 }
 
 func (f *buildFlags) register(c *cobra.Command) {
@@ -47,7 +47,7 @@ func (f *buildFlags) register(c *cobra.Command) {
 	c.Flags().StringVar(&f.slim, "slim", slim.Safe, "cleanup profile: off | safe | aggressive")
 	c.Flags().StringVar(&f.squash, "squash", slim.SquashApp, "layer squash: app (Dockerfile layers) | all | off")
 	c.Flags().StringVar(&f.platforms, "platform", os.Getenv("FORGE_PLATFORM"), "target platforms, comma separated (e.g. linux/amd64,linux/arm64; default: this machine) [$FORGE_PLATFORM]")
-	c.Flags().BoolVar(&f.noEmulate, "no-emulation", false, "never enable QEMU emulation: RUN steps of a foreign architecture fail instead")
+	c.Flags().BoolVar(&f.emulate, "emulate", os.Getenv("FORGE_EMULATE") != "", "allow QEMU emulation for RUN steps of a foreign architecture (dev convenience; needs root; prefer native runners) [$FORGE_EMULATE]")
 }
 
 // gateFlags configure the security gates.
@@ -139,8 +139,8 @@ func clip(s string, n int) string {
 }
 
 func emulator(u *ui.UI, g *globalFlags, f *buildFlags) func(context.Context, string) error {
-	if f.noEmulate {
-		return nil
+	if !f.emulate {
+		return nil // native only: foreign RUN steps fail with a clear message
 	}
 	m := &emulation.Manager{
 		CacheDir: g.cacheDir,

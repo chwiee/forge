@@ -63,61 +63,102 @@ steps:
 
 As cores ANSI aparecem no log do Azure DevOps (o forge detecta `TF_BUILD`).
 
-## GitHub Actions
+## GitHub Actions em pods (ARC) + Karpenter — multi-arch nativo, sem QEMU
 
-```yaml
-jobs:
-  image:
-    runs-on: ubuntu-latest
-    permissions: {contents: read, packages: write}
-    steps:
-      - uses: actions/checkout@v4
-      - name: forge   # (as releases ainda não foram publicadas)
-        run: |
-          curl -fsSL -o forge https://github.com/chwiee/forge/releases/latest/download/forge-linux-amd64
-          chmod +x forge
-          sudo -E ./forge run . --registry ghcr --name ${{ github.event.repository.name }} --tag ${{ github.sha }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+Modelo recomendado. Cada arquitetura compila no seu próprio nó, **sem emulação**, e
+cada pod publica sozinho. Não há job de "junção".
+
+```
+ workflow (matrix arch)
+   ├─ runs-on: arc-amd64 ─► Karpenter sobe nó x86      ─► forge run --multiarch ... ─┐
+   └─ runs-on: arc-arm64 ─► Karpenter sobe nó Graviton ─► forge run --multiarch ... ─┤
+                                                                                    ▼
+            cada pod: build nativo → gates → push <tag>-<arch> → se todas as arquiteturas
+            deste run existem no registry, grava o índice multi-arch em <tag>
 ```
 
-`sudo` dá o modo de isolamento `full` no runner hospedado. Sem sudo funciona em modo `rootless`,
-mas Dockerfiles com `adduser`/`chown` para outro usuário falham.
+| Peça | Arquivo |
+|---|---|
+| NodePool do Karpenter (amd64 + arm64, spot, taint `ci`) | [`deploy/karpenter/nodepool-ci.yaml`](../deploy/karpenter/nodepool-ci.yaml) |
+| Runner scale set por arquitetura (`hostUsers: false`) | [`deploy/arc/values-arm64.yaml`](../deploy/arc/values-arm64.yaml) (copie para amd64) |
+| Imagem do runner com o forge | [`deploy/arc/Dockerfile.runner`](../deploy/arc/Dockerfile.runner) |
 
-## Local (WSL 2)
+Workflow:
+
+```yaml
+name: image
+on: {push: {branches: [main]}}
+permissions: {id-token: write, contents: read}
+jobs:
+  image:
+    strategy:
+      fail-fast: false           # one arch failing must not hide the other's report
+      matrix: {arch: [amd64, arm64]}
+    runs-on: arc-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: forge
+        run: >
+          forge run .
+          --registry ecr --name ${{ github.event.repository.name }} --create-repo
+          --tag ${{ github.sha }} --tag latest
+          --multiarch linux/amd64,linux/arm64
+          --report forge-${{ matrix.arch }}.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: forge-${{ matrix.arch }}, path: forge-${{ matrix.arch }}.json}
+```
+
+Como a junção é segura sem um job extra nem trava no registry:
+
+- cada pod **publica antes de verificar**; quem verifica por último sempre enxerga as duas arquiteturas;
+- se os dois enxergarem ao mesmo tempo, os dois gravam **o mesmo índice byte a byte** (ordem fixa) — mesmo digest;
+- as imagens por arquitetura levam os labels `dev.forge.build-id` (`GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT`) e
+  `dev.forge.gates=passed`: nunca se junta com um `<tag>-arm64` de outro run nem com imagem reprovada;
+- se uma arquitetura reprova nos gates, ela não publica e a tag `<tag>` **não é criada** — nada parcial em produção.
+
+Testado: 30 rodadas de publicação simultânea num registry em memória (`internal/cli/multiarch_test.go`)
+— a tag final sempre com as duas arquiteturas.
+
+Credenciais: o service account do runner com **EKS Pod Identity/IRSA** (permissões de push no ECR) —
+nenhum segredo no workflow. Para GHCR, `GITHUB_TOKEN` com `packages: write`.
+
+### Por que `hostUsers: false` (e não `privileged`)
+
+O pod roda como root **dentro** de um user namespace do Kubernetes; no nó ele é um uid sem privilégio
+(testado no k3s v1.36: `0 → 2544631808`). O forge cria seu namespace aninhado para os RUN
+(`forge doctor` mostra `isolation: user namespace`). Sem `privileged`, sem capabilities extras.
+Requer Kubernetes 1.33+ e containerd 2.x (EKS 1.33+ atende).
+
+### Emulação QEMU
+
+Desligada por padrão. `--emulate` só para dev local (precisa de root real e registra um handler
+global no kernel do nó). Em CI, use runners nativos como acima.
+
+## Local (WSL 2) — sem sudo
 
 Use uma distro Linux (Ubuntu), **não** a `docker-desktop`, e trabalhe no filesystem do WSL
 (`~/projetos/...`), não em `/mnt/c` (lento e sem dono/permissão Linux).
 
-```bash
-sudo forge run . --no-push        # tudo menos o push
-forge doctor                      # mostra o nível de isolamento disponível
-```
-
-## Multi-arch no CI
-
-**Opção 1 — um job, emulação** (simples; RUN emulados são mais lentos; precisa de root com `binfmt_misc` gravável — `sudo` no runner hospedado do GitHub, pod `privileged` no Kubernetes):
+Uma vez só (pacote de ~100 KB com os helpers `newuidmap`/`newgidmap`):
 
 ```bash
-sudo -E forge run . --registry ghcr --name api --platform linux/amd64,linux/arm64
+sudo apt install uidmap
 ```
 
-**Opção 2 — runners nativos + manifest** (rápido; sem privilégios; recomendado no EKS com nós Graviton):
+Depois, tudo sem `sudo`:
 
-```yaml
-# GitLab: dois jobs em runners com tags diferentes + um job que junta
-build-amd64:
-  tags: [k8s-amd64]
-  script: [forge run . --no-push --oci out/amd64]
-  artifacts: {paths: [out/amd64, .forge/report.json]}
-build-arm64:
-  tags: [k8s-arm64]
-  script: [forge run . --no-push --oci out/arm64]
-  artifacts: {paths: [out/arm64]}
-publish:
-  needs: [build-amd64, build-arm64]
-  script:
-    - forge manifest out/amd64 out/arm64 --registry ecr --name $CI_PROJECT_PATH_SLUG --tag $CI_COMMIT_SHORT_SHA
+```bash
+forge doctor              # deve mostrar: user rootless (uids 100000-165535), isolation full
+forge run . --no-push
+forge run . --registry ecr --name app --region us-east-2 --create-repo
 ```
 
-Cada `forge run` já aplicou os gates; o `forge manifest` recusa qualquer pasta marcada como reprovada.
+O forge se re-executa num user namespace com a sua faixa do `/etc/subuid` (o Ubuntu reserva 65.536
+uids ao criar o usuário): `adduser`, `chown` e `apt` funcionam, e os donos dos arquivos são gravados
+corretamente na imagem. Sem o `uidmap`, ele cai num modo limitado (só o seu uid) e o `doctor` explica.
+
+Credenciais AWS do Windows no WSL: `ln -s /mnt/c/Users/<você>/.aws ~/.aws`.
+
+Emulação (dev): `sudo forge emulation install arm64` uma vez por sessão do WSL; depois
+`forge run . --platform linux/arm64 --emulate` sem sudo.

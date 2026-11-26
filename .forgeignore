@@ -1,0 +1,3 @@
+# build context of forge's own images: only the binary is needed
+*
+!bin/forge

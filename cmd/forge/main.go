@@ -9,6 +9,7 @@ import (
 
 	"github.com/chwiee/forge/internal/cli"
 	"github.com/chwiee/forge/internal/sandbox"
+	"github.com/chwiee/forge/internal/userns"
 
 	_ "golang.org/x/crypto/x509roots/fallback" // CA roots for scratch/distroless runners
 )
@@ -19,5 +20,7 @@ func main() {
 		sandbox.Child()
 		return
 	}
+	// non-root: continue inside a user namespace with the caller's subuid range
+	userns.MaybeReexec()
 	os.Exit(cli.Execute())
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/chwiee/forge/internal/sandbox"
 	"github.com/chwiee/forge/internal/scan"
 	"github.com/chwiee/forge/internal/ui"
+	"github.com/chwiee/forge/internal/userns"
 )
 
 // ---- db ----
@@ -150,7 +151,14 @@ func newDoctorCmd(g *globalFlags) *cobra.Command {
 			warn := func(k, v string) { u.Line(fmt.Sprintf("  %s %-11s %s", u.Warning("▲"), k, v)) }
 			bad := func(k, v string) { u.Line(fmt.Sprintf("  %s %-11s %s", u.Bad("✖"), k, v)) }
 
-			ok("user", fmt.Sprintf("uid=%d", os.Geteuid()))
+			switch {
+			case userns.Inside():
+				ok("user", "rootless: user namespace with your subordinate ids ("+userns.Describe()+")")
+			case os.Geteuid() == 0:
+				ok("user", "root")
+			default:
+				warn("user", fmt.Sprintf("uid=%d, single-uid rootless: %s", os.Geteuid(), userns.Check().Reason))
+			}
 			switch lvl := sandbox.Level(); lvl {
 			case sandbox.Full:
 				ok("isolation", "full (namespaces + /proc + chroot)")

@@ -13,6 +13,7 @@ metadata:
   namespace: ci
 spec:
   restartPolicy: Never
+  hostUsers: false               # pod root = unprivileged uid on the node (K8s 1.33+)
   serviceAccountName: forge-ci   # with Pod Identity / IRSA for ECR push
   containers:
     - name: forge

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -65,6 +66,7 @@ func newRunCmd(g *globalFlags) *cobra.Command {
 	gf := &gateFlags{}
 	pf := &pushFlags{}
 	var noPush, failFast bool
+	var multiarch, buildID string
 	var reportPath, ociOut string
 	var jobs int
 
@@ -97,6 +99,25 @@ the remaining builds and blocks the push; --fail-fast cancels at once.`,
 			platforms, err := builder.ParsePlatforms(bf.platforms)
 			if err != nil {
 				return err
+			}
+			// --multiarch: this runner builds only its own architecture natively and
+			// joins the others published by sibling runners of the same build id.
+			var expected []v1.Platform
+			if multiarch != "" {
+				if expected, err = builder.ParsePlatforms(multiarch); err != nil {
+					return err
+				}
+				own, err := ownPlatform(expected, bf.platforms)
+				if err != nil {
+					return err
+				}
+				platforms = []v1.Platform{own}
+				if buildID == "" {
+					buildID = defaultBuildID()
+				}
+				if buildID == "" && !noPush {
+					return fmt.Errorf("--multiarch needs a build id shared by every runner: set --build-id (GitHub Actions, GitLab and Azure DevOps provide one automatically)")
+				}
 			}
 			multi := len(platforms) > 1
 			if jobs <= 0 || jobs > len(platforms) {
@@ -329,6 +350,18 @@ the remaining builds and blocks the push; --fail-fast cancels at once.`,
 			case !rep.Passed:
 				u.Start("Push").Fail("blocked by security gates")
 				rep.Push = &report.Push{Registry: pf.registry, Skipped: "gates failed"}
+			case len(expected) > 0:
+				// distributed multi-arch: publish <tag>-<arch>, the last runner writes <tag>
+				archRef, idxDigest, joined, err := publishArch(cmd.Context(), u, runs[0].image, runs[0].platform, target, expected, buildID)
+				if err != nil {
+					return stageErr("push", err)
+				}
+				rep.Push = &report.Push{Registry: target.Kind, Refs: []string{archRef}, Digest: idxDigest}
+				if joined {
+					for i := range target.Tags {
+						rep.Push.Refs = append(rep.Push.Refs, target.Ref(i).String())
+					}
+				}
 			default:
 				digest, err := doPush(cmd.Context(), u, art, target)
 				if err != nil {
@@ -370,6 +403,8 @@ the remaining builds and blocks the push; --fail-fast cancels at once.`,
 	c.Flags().BoolVar(&noPush, "no-push", false, "run everything except the push")
 	c.Flags().BoolVar(&failFast, "fail-fast", false, "cancel everything at the first failed gate (default: finish the checks of that image for a complete report)")
 	c.Flags().IntVar(&jobs, "jobs", 0, "platforms built at the same time (default: all)")
+	c.Flags().StringVar(&multiarch, "multiarch", os.Getenv("FORGE_MULTIARCH"), "distributed multi-arch: every platform of the final tag (e.g. linux/amd64,linux/arm64); each runner builds its own natively, pushes <tag>-<arch> and the last one writes <tag> [$FORGE_MULTIARCH]")
+	c.Flags().StringVar(&buildID, "build-id", "", "id shared by the runners of one --multiarch build (default: GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT, CI_PIPELINE_ID, BUILD_BUILDID)")
 	c.Flags().StringVar(&reportPath, "report", ".forge/report.json", "JSON report path (empty disables)")
 	c.Flags().StringVar(&ociOut, "oci", "", "also save the result as an OCI layout directory (input for forge push/manifest)")
 	return c

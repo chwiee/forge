@@ -1,0 +1,54 @@
+# forge as a Kubernetes Job with the distroless image (Dockerfile.distroless).
+#
+# Security model (tested on k3s v1.36 with WSL2 kernel 6.18):
+#   hostUsers: false   -> Kubernetes user namespaces: uid 0 in the pod is an
+#                         unprivileged uid on the node (seen: 0 -> 2544631808)
+#   no privileged, no extra capabilities
+#   seccomp Unconfined -> lets forge create its nested user namespace for RUN
+# `forge doctor` in this pod reports: isolation "user namespace".
+# Needs Kubernetes 1.33+ (user namespaces on by default) and a runtime with
+# idmapped mounts (containerd 2.x / CRI-O 1.30+).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: forge-build
+  namespace: ci
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      hostUsers: false
+      serviceAccountName: forge-ci          # Pod Identity / IRSA for ECR push
+      securityContext:
+        seccompProfile: {type: Unconfined}
+      nodeSelector:
+        kubernetes.io/arch: arm64           # Karpenter provisions a Graviton node if needed
+      initContainers:
+        - name: checkout                    # distroless has no git: fetch sources first
+          image: docker.io/alpine/git:2.47.2
+          args: ["clone", "--depth=1", "--branch=main", "https://github.com/ORG/APP.git", "/workspace"]
+          volumeMounts: [{name: workspace, mountPath: /workspace}]
+      containers:
+        - name: forge
+          image: ghcr.io/chwiee/forge:distroless
+          args: ["run", "/workspace", "--registry", "ecr", "--name", "team/app", "--create-repo",
+                 "--multiarch", "linux/amd64,linux/arm64", "--build-id", "$(BUILD_ID)"]
+          env:
+            - {name: BUILD_ID, value: "manual-1"}   # same value on the amd64 and arm64 Jobs
+            - {name: AWS_REGION, value: us-east-2}
+            - {name: FORGE_DB_URL, value: "http://forge-db.forge.svc.cluster.local:8080/databases"}
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+          resources:
+            requests: {cpu: "2", memory: 2Gi}
+            limits: {memory: 6Gi}
+          volumeMounts:
+            - {name: workspace, mountPath: /workspace}
+            - {name: cache, mountPath: /cache}
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: cache
+          emptyDir: {sizeLimit: 20Gi}         # or a PVC to keep layers + vulnerability DB warm

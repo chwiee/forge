@@ -187,6 +187,9 @@ func (m *Manager) Ensure(ctx context.Context, archName string) error {
 	if os.Geteuid() != 0 {
 		return ErrNeedRoot
 	}
+	if os.Getenv("FORGE_USERNS") == "ready" { // rootless namespace: not real root
+		return fmt.Errorf("registering the %s emulator needs real root: run once `sudo forge emulation install %s` (lasts until WSL restarts), then build without sudo", archName, archName)
+	}
 	if err := mountBinfmt(); err != nil {
 		return err
 	}
@@ -197,6 +200,9 @@ func (m *Manager) Ensure(ctx context.Context, archName string) error {
 	line := fmt.Sprintf(":%s%s:M:0:%s:%s:%s:CFP", prefix, def.binary, def.magic, def.mask, bin)
 	f, err := os.OpenFile(filepath.Join(binfmtDir, "register"), os.O_WRONLY, 0)
 	if err != nil {
+		if os.Getenv("FORGE_USERNS") == "ready" {
+			return fmt.Errorf("registering the %s emulator needs real root: run once `sudo forge emulation install %s` (lasts until WSL restarts), then build without sudo", archName, archName)
+		}
 		return fmt.Errorf("binfmt_misc register: %w (in a pod this needs privileged; prefer native runners)", err)
 	}
 	_, err = f.Write([]byte(line))

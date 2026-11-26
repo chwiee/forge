@@ -123,7 +123,20 @@ O destino é resolvido **antes** do build (credencial errada falha em segundos).
 - Deliberadamente **não** fazemos upload antecipado das camadas: uma camada com segredo poderia chegar ao registry (sem tag, mas baixável por digest) antes do gate de Leaks.
 - UI: região viva com uma linha por etapa ativa; no CI e com várias plataformas, sub-linhas prefixadas com a etapa.
 
-## Limitações conhecidas (v0.3)
+## Rootless (WSL sem sudo) e pods com `hostUsers: false`
+
+- **WSL/usuário comum** (`internal/userns`): o forge se re-executa num user namespace; o pai chama `newuidmap`/`newgidmap` (pacote `uidmap`) mapeando `0 → você` e `1..65536 → sua faixa do /etc/subuid`. O filho espera o mapeamento e se re-executa de novo — o kernel só concede as capabilities do namespace num `execve` feito já como uid 0. Lá dentro o forge é "root" com todos os uids reais: extração mantém donos, `adduser`/`chown`/`apt` funcionam, a camada grava os uids certos. Testado: `adduser -u 10001` + `chown` → `10001` gravado na imagem.
+- **Pod `hostUsers: false`**: o pod só enxerga 65.536 uids. O nível `userns` espelha `/proc/self/uid_map` (antes pedia 2^31 e falharia). Testado no k3s v1.36 com a imagem distroless: `doctor` = `user namespace`, `adduser`, `apt-get` e `go build` ok; uid 0 do pod = uid 2544631808 no nó.
+- Emulação QEMU é **opt-in** (`--emulate`): em namespace rootless o registro no `binfmt_misc` exige root real (`sudo forge emulation install <arch>` uma vez).
+
+## Multi-arch distribuído (`--multiarch`)
+
+- Cada runner constrói só a sua arquitetura (nativa), roda os gates, grava os labels `dev.forge.build-id` e `dev.forge.gates=passed` e publica `<tag>-<arch>`.
+- Depois confere `<tag>-<arch>` de todas as plataformas esperadas; se todas têm o mesmo build-id e gates aprovados, grava o índice (ordem fixa por plataforma → mesmo digest em qualquer runner) em todas as tags.
+- Correção sem trava: cada runner publica **antes** de verificar, então o último a verificar sempre vê todos; escritas simultâneas são idênticas. Coberto por `internal/cli/multiarch_test.go` (30 rodadas concorrentes + rejeição de build-id antigo).
+- Build-id padrão: `GITHUB_RUN_ID-GITHUB_RUN_ATTEMPT`, `gl-CI_PIPELINE_ID`, `ado-BUILD_BUILDID` (ou `--build-id`).
+
+## Limitações conhecidas (v0.4)
 
 - `RUN --mount` (cache/secret/bind) é ignorado com aviso.
 - `ONBUILD` é ignorado.

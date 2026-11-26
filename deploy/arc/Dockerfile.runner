@@ -1,0 +1,11 @@
+# GitHub Actions runner image (ARC runner scale sets) with forge inside.
+# Build it with forge on each architecture (or --multiarch on an amd64 and an
+# arm64 runner) and point the scale sets at it.
+# Pin the runner version you validated; "latest" is only a placeholder.
+FROM ghcr.io/actions/actions-runner:latest
+USER root
+COPY bin/forge /usr/local/bin/forge
+# the runner runs as root inside the pod; with hostUsers: false that root is an
+# unprivileged uid on the node
+ENV RUNNER_ALLOW_RUNASROOT=1 \
+    FORGE_CACHE_DIR=/cache

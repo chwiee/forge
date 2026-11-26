@@ -1,0 +1,13 @@
+# forge for Kubernetes pods/Jobs and the forge-db mirror: no shell, no package
+# manager, just the static binary. Build it with forge itself:
+#   make build && forge build . -f Dockerfile.distroless
+# Runs as root INSIDE the pod; use hostUsers: false so that root is an
+# unprivileged user on the node (see deploy/k8s/forge-job.yaml).
+# For CI job containers that need a shell (GitHub/GitLab/Azure), use Dockerfile.
+FROM gcr.io/distroless/static-debian12@sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2
+COPY bin/forge /usr/local/bin/forge
+ENV FORGE_CACHE_DIR=/cache \
+    FORGE_PLAIN=1
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/forge"]
+CMD ["--help"]

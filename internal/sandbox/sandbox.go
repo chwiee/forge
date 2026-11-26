@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -98,8 +99,10 @@ func sysProcAttr(level string) *syscall.SysProcAttr {
 		// creating a user namespace needs no capability; inside it we may mount /proc and /dev.
 		// identity mapping keeps every uid real, so apt's _apt user and chown work.
 		attr.Cloneflags = unix.CLONE_NEWUSER | unix.CLONE_NEWNS | unix.CLONE_NEWPID | unix.CLONE_NEWUTS | unix.CLONE_NEWIPC
-		attr.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: 0, Size: 1 << 31}}
-		attr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: 0, Size: 1 << 31}}
+		// mirror the ids this process can see: the whole range on a host, only the
+		// pod's 65536 ids under Kubernetes hostUsers: false (asking for more fails).
+		attr.UidMappings = identityMap("/proc/self/uid_map")
+		attr.GidMappings = identityMap("/proc/self/gid_map")
 		attr.GidMappingsEnableSetgroups = true
 	case Rootless:
 		attr.Cloneflags = unix.CLONE_NEWUSER | unix.CLONE_NEWNS | unix.CLONE_NEWPID | unix.CLONE_NEWUTS | unix.CLONE_NEWIPC
@@ -215,4 +218,33 @@ func readOr(p, def string) []byte {
 		return []byte(def)
 	}
 	return b
+}
+
+// identityMap maps every id visible in this namespace to itself in the child
+// namespace. /proc/self/uid_map lines are "inside outside count".
+func identityMap(file string) []syscall.SysProcIDMap {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return []syscall.SysProcIDMap{{ContainerID: 0, HostID: 0, Size: 1}}
+	}
+	var out []syscall.SysProcIDMap
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 3 {
+			continue
+		}
+		inside, err1 := strconv.Atoi(f[0])
+		count, err2 := strconv.ParseInt(f[2], 10, 64)
+		if err1 != nil || err2 != nil || count <= 0 {
+			continue
+		}
+		if count > 1<<31 { // Go's SysProcIDMap.Size is an int; the kernel caps at 2^32-1
+			count = 1 << 31
+		}
+		out = append(out, syscall.SysProcIDMap{ContainerID: inside, HostID: inside, Size: int(count)})
+	}
+	if len(out) == 0 {
+		return []syscall.SysProcIDMap{{ContainerID: 0, HostID: 0, Size: 1}}
+	}
+	return out
 }

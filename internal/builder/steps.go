@@ -293,7 +293,7 @@ func (b *builder) run(st *stage, c *instructions.RunCommand, text string) (bool,
 	return b.fsStep(st, key, text, func(root string) error {
 		if !emulation.Native(st.platform) {
 			if b.opts.Emulator == nil {
-				return fmt.Errorf("RUN for %s needs emulation on this %s machine: enable it (default) or build on a native %s runner and join with `forge manifest`",
+				return fmt.Errorf("RUN for %s cannot execute on this %s machine: build it on a native %s runner (forge run --multiarch ...), or pass --emulate to use QEMU (dev only, needs root)",
 					PlatformString(st.platform), HostPlatform().Architecture, st.platform.Architecture)
 			}
 			if err := b.opts.Emulator(b.ctx, st.platform.Architecture); err != nil {

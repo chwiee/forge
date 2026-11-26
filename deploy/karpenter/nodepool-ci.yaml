@@ -1,0 +1,26 @@
+# Karpenter NodePool for CI runners: amd64 AND arm64 (Graviton), spot first.
+# A pending runner pod with nodeSelector kubernetes.io/arch=arm64 makes
+# Karpenter launch a Graviton node; amd64 pods get an x86 node. No QEMU.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: ci
+spec:
+  template:
+    metadata:
+      labels: {workload: ci}
+    spec:
+      taints:
+        - {key: ci, value: "true", effect: NoSchedule}   # only CI pods land here
+      nodeClassRef: {group: karpenter.k8s.aws, kind: EC2NodeClass, name: ci}
+      requirements:
+        - {key: kubernetes.io/arch, operator: In, values: [amd64, arm64]}
+        - {key: karpenter.sh/capacity-type, operator: In, values: [spot, on-demand]}
+        - {key: karpenter.k8s.aws/instance-category, operator: In, values: [c, m]}
+        - {key: karpenter.k8s.aws/instance-generation, operator: Gt, values: ["6"]}
+      expireAfter: 24h
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 2m          # idle CI nodes go away fast
+  limits:
+    cpu: "200"

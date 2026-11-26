@@ -1,0 +1,43 @@
+# ARC runner scale set for arm64 (helm chart gha-runner-scale-set).
+# Install one per architecture:
+#   helm install arc-arm64 oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+#     -n arc-runners -f values-arm64.yaml
+#   helm install arc-amd64 ... -f values-amd64.yaml   (same file, arch amd64)
+# Workflows pick it with `runs-on: arc-arm64`. Karpenter creates the node.
+githubConfigUrl: https://github.com/ORG
+githubConfigSecret: arc-github-app
+runnerScaleSetName: arc-arm64
+minRunners: 0
+maxRunners: 10
+template:
+  spec:
+    hostUsers: false                       # pod root = unprivileged uid on the node
+    serviceAccountName: forge-ci           # Pod Identity / IRSA -> ECR push
+    securityContext:
+      seccompProfile: {type: Unconfined}   # forge creates a nested user namespace for RUN
+    nodeSelector:
+      kubernetes.io/arch: arm64
+    tolerations:
+      - {key: ci, operator: Equal, value: "true", effect: NoSchedule}
+    containers:
+      - name: runner
+        image: ghcr.io/ORG/actions-runner-forge:VERSION   # deploy/arc/Dockerfile.runner
+        command: ["/home/runner/run.sh"]
+        securityContext:
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+        env:
+          - {name: FORGE_DB_URL, value: "http://forge-db.forge.svc.cluster.local:8080/databases"}
+          - {name: AWS_REGION, value: us-east-2}
+        resources:
+          requests: {cpu: "2", memory: 4Gi}
+          limits: {memory: 8Gi}
+        volumeMounts:
+          - {name: cache, mountPath: /cache}
+    volumes:
+      - name: cache
+        ephemeral:                         # per-runner volume; use a PVC pool to keep it warm
+          volumeClaimTemplate:
+            spec:
+              accessModes: [ReadWriteOnce]
+              resources: {requests: {storage: 30Gi}}

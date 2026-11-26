@@ -90,27 +90,36 @@ O `forge run` executa um grafo de dependências, não uma fila:
 | Erro técnico (sessão AWS expirada, banco indisponível, RUN quebrado) | cancela **tudo** na hora; a mensagem nomeia a etapa (`registry: AWS session expired — run aws login`); as outras aparecem como `○ cancelled (registry failed)` |
 | Gate reprovado numa plataforma | as verificações daquela imagem terminam (relatório completo), os builds ainda em andamento são cancelados, o push é bloqueado |
 | `--fail-fast` | cancela tudo no primeiro gate reprovado |
-| `--jobs N` | limita builds simultâneos (RUN emulado usa muita CPU) |
+| `--jobs N` | limita builds simultâneos (`--platform` com várias arquiteturas na mesma máquina) |
 
 Medido no WSL: sessão AWS expirada derruba o pipeline em **0,45 s** (antes: depois do build inteiro);
 multi-arch amd64+arm64 sem cache em **~12 s** (sequencial: ~20 s com cache).
 
 ## Multi-arch (amd64 + arm64 numa tag só)
 
+**Produção — um runner nativo por arquitetura, sem QEMU** (GitHub Actions + ARC + Karpenter):
+
 ```bash
-sudo forge run . --registry ecr --name api --platform linux/amd64,linux/arm64
+# o mesmo comando em cada runner (amd64 e arm64); o último a terminar publica a tag multi-arch
+forge run . --registry ecr --name api --tag v1 --multiarch linux/amd64,linux/arm64
 ```
 
-O forge constrói uma imagem por plataforma (build, slim, scan, sec e leaks **para cada uma**) e publica
-**uma tag** (manifest list / OCI index): `docker pull` e o kubelet escolhem a arquitetura sozinhos.
+Cada runner faz build, slim, scan, sec e leaks da **sua** arquitetura, publica `v1-amd64`/`v1-arm64`
+e, quando todas as arquiteturas daquele run (`dev.forge.build-id`) existem, grava `v1` como índice.
+Sem job de junção, sem trava no registry, nada parcial se um gate reprovar. Guia completo e
+manifests: [docs/ci.md](docs/ci.md#github-actions-em-pods-arc--karpenter--multi-arch-nativo-sem-qemu).
+
+**Numa máquina só** (todas as plataformas no mesmo processo):
+
+```bash
+forge run . --registry ecr --name api --platform linux/amd64,linux/arm64
+```
 
 | Peça | Como funciona |
 |---|---|
-| Dockerfile multi-arch padrão | `FROM --platform=$BUILDPLATFORM` + `ARG TARGETOS TARGETARCH`: o stage de compilação roda **nativo** e faz cross-compile; o cache é compartilhado entre as plataformas. Exemplo: [`examples/multiarch`](examples/multiarch/Dockerfile). |
-| RUN de outra arquitetura | o forge baixa o QEMU estático de uma imagem fixada por digest (`tonistiigi/binfmt`, a mesma fonte do buildx) e registra no `binfmt_misc` do kernel — sem daemon, sem pacote. Precisa de root; vale até o reboot (no WSL, até a distro reiniciar — o forge re-registra sozinho quando um RUN precisa). |
-| Runners nativos (mais rápido) | cada runner (x86, Graviton) roda `forge run . --no-push --oci out/<arch>`; um job final junta: `forge manifest out/amd64 out/arm64 --registry ecr --name api`. Imagens que reprovaram nos gates são recusadas. |
-
-Testado no WSL: imagem arm64 construída num x86, binário aarch64 executado de dentro do rootfs dela.
+| Dockerfile multi-arch padrão | `FROM --platform=$BUILDPLATFORM` + `ARG TARGETOS TARGETARCH`: o stage de compilação roda **nativo** e faz cross-compile; o cache é compartilhado entre as plataformas. Exemplo: [`examples/multiarch`](examples/multiarch/Dockerfile). Assim nem precisa de emulação. |
+| RUN de outra arquitetura | só com `--emulate` (dev): QEMU estático fixado por digest registrado no `binfmt_misc`. Desligado por padrão — o QEMU não é barreira de segurança e o registro vale para o kernel inteiro. |
+| Juntar imagens prontas | `forge manifest out/amd64 out/arm64 --registry ecr --name api` (pastas OCI ou refs); recusa imagens reprovadas. |
 
 ## Destinos
 
@@ -132,9 +141,11 @@ Manifests: [`deploy/k8s/forge-db.yaml`](deploy/k8s/forge-db.yaml).
 ## Requisitos
 
 - Linux (WSL 2 com Ubuntu, container ou pod). Nada mais.
-- Para os RUN: root **ou** user namespaces habilitados. Num pod: `runAsUser: 0` + seccomp `Unconfined`
-  (padrão do Kubernetes) — **sem `privileged` e sem capabilities extras**. Veja [`deploy/k8s/runner-pod.yaml`](deploy/k8s/runner-pod.yaml).
-- No WSL use `sudo forge` e trabalhe fora de `/mnt/c`.
+- **Pod Kubernetes:** imagem distroless ([`Dockerfile.distroless`](Dockerfile.distroless)) com `hostUsers: false`
+  (root do pod = uid sem privilégio no nó) + seccomp `Unconfined` — **sem `privileged`, sem capabilities extras**.
+  Testado no k3s v1.36. Veja [`deploy/k8s/forge-job.yaml`](deploy/k8s/forge-job.yaml).
+- **WSL, sem sudo:** `sudo apt install uidmap` uma vez; depois o forge roda como seu usuário, com uids
+  próprios (`/etc/subuid`). Trabalhe fora de `/mnt/c`.
 
 ## Compilar
 

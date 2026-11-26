@@ -264,7 +264,7 @@ func newScanCmd(g *globalFlags) *cobra.Command {
 				if multi {
 					title = builder.PlatformString(s.platform)
 				}
-				printDetails(u, title, r, nil, nil)
+				printDetails(u, title, r, nil, nil, gf.policy(), detailCtx{})
 				results[builder.PlatformString(s.platform)] = r
 				if r.Failed {
 					failed = append(failed, builder.PlatformString(s.platform)+": "+r.Reason)
@@ -381,7 +381,7 @@ sources (forge build, or OCI written elsewhere) are scanned first.`,
 						return err
 					}
 					if r.Failed {
-						printDetails(u, builder.PlatformString(s.platform), r, nil, nil)
+						printDetails(u, builder.PlatformString(s.platform), r, nil, nil, gf.policy(), detailCtx{})
 						u.Start("Push").Fail("blocked: " + r.Reason)
 						return &gateError{msg: r.Reason}
 					}

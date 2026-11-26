@@ -375,15 +375,17 @@ the remaining builds and blocks the push; --fail-fast cancels at once.`,
 				rep.Push = &report.Push{Registry: target.Kind, Refs: refs, Digest: digest}
 			}
 
-			if rep.ContextLeaks != nil && len(rep.ContextLeaks.Findings) > 0 {
-				printDetails(u, "", nil, nil, rep.ContextLeaks)
-			}
+			dctx := detailCtx{dockerfile: rep.Dockerfile, contextDir: contextDir}
+			// blocking reasons first: they are what the pipeline user reads
 			for _, p := range rep.Platforms {
 				title := ""
 				if multi {
 					title = p.Platform
 				}
-				printDetails(u, title, p.CVE, p.Sec, p.Leaks)
+				printDetails(u, title, p.CVE, p.Sec, p.Leaks, rep.Gates, dctx)
+			}
+			if rep.ContextLeaks != nil && len(rep.ContextLeaks.Findings) > 0 {
+				printDetails(u, "", nil, nil, rep.ContextLeaks, rep.Gates, dctx)
 			}
 
 			rep.Duration = time.Since(start).Round(time.Millisecond).String()
@@ -391,6 +393,9 @@ the remaining builds and blocks the push; --fail-fast cancels at once.`,
 				u.Warn("report: " + err.Error())
 			}
 			printSummary(u, rep, target, time.Since(start), reportPath)
+			if err := writeStepSummary(rep, target); err != nil {
+				u.Warn("job summary: " + err.Error())
+			}
 
 			if !rep.Passed {
 				return &gateError{msg: strings.Join(rep.Failures, "; ")}

@@ -404,3 +404,17 @@ func HumanBytes(n int64) string {
 	}
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "kMGTPE"[exp])
 }
+
+// Out returns a writer whose lines are printed like Line (spinner-safe); CI
+// log commands (::group::, ##vso[...]) go through it.
+func (u *UI) Out() io.Writer { return lineWriter{u} }
+
+type lineWriter struct{ u *UI }
+
+func (w lineWriter) Write(p []byte) (int, error) {
+	s := strings.TrimSuffix(string(p), "\n")
+	for _, line := range strings.Split(s, "\n") {
+		w.u.println(line)
+	}
+	return len(p), nil
+}

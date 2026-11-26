@@ -133,40 +133,47 @@ na tabela e no JSON. `--only-fixed=false` faz contar todas. `(KEV)` = explorada 
 
 ```
 $ forge run . --no-push
-
-  ▲ forge v0.4.1-dev  ·  build · slim · scan · sec · leaks · push
+  ▲ forge v0.4.2-dev  ·  build · slim · scan · sec · leaks · push
 
   context   /home/forgetest/forge-examples/go-multistage
 
-  ▸ Build
   ▸ VulnDB
+  ▸ Build
   ▸ Context
-  ▲ Context 1 secret(s) in the build context — Leaks checks what ships in the image 20ms
-  ✔ VulnDB  ready · built 2026-11-25 06:22 1.0s
+  ▲ Context 1 secret(s) in the build context — Leaks checks what ships in the image 24ms
     ↺ 1/8     WORKDIR /src  cached
     ↺ 2/8     COPY go.mod main.go ./  cached
     ↺ 3/8     RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/app .  cached
     ↺ 4/8     RUN apt-get update && apt-get install -y ca-certificates  cached
+  ✔ VulnDB  ready · built 2026-11-26 06:22 2.5s
     ↺ 5/8     COPY --from=build /out/app /usr/local/bin/app  cached
     ↺ 6/8     COPY config.yaml /etc/app/config.yaml  cached
     · 7/8     USER 65532:65532
     · 8/8     ENTRYPOINT ["/usr/local/bin/app"]
-  ✔ Build   8 steps · 6 cached · 4 layers · 47.9 MB 8.3s
+  ✔ Build   8 steps · 6 cached · 4 layers · 47.9 MB 8.6s
   ▸ Slim
   ✔ Slim    47.9 MB → 32.6 MB  (−32.0%) · 4 → 2 layers · cached 0ms
   ▸ Leaks
   ▸ Scan
   ▸ Sec
-  ✔ Sec     score 94/100 (A) · 3 findings 36ms
-  ✖ Leaks   1 secret(s) in the image · 0 in context 71ms
-  ✖ Scan    4 critical · 84 high · 116 medium · 19 low · 44 fixable · 92 packages 1.6s
+  ✔ Sec     score 94/100 (A) · 3 findings 44ms
+  ✖ Leaks   1 secret(s) in the image · 0 in context 94ms
+  ✖ Scan    4 critical · 84 high · 116 medium · 19 low · 44 fixable · 92 packages 1.8s
 
   ▸ Push
   ○ Push    skipped (--no-push) 0ms
 
-  Secrets
-    ● context  github-pat  config.yaml:4  ghp_********
-    accept a false positive: add its fingerprint (file:rule:line) to .gitleaksignore
+  ✖ Why the push was blocked
+
+    CVE gate: 2 vulnerabilities ≥ critical with a fix available
+    SEVERITY  ID              PACKAGE  VERSION    FIXED IN        WHERE
+    Critical  CVE-2026-56857  stdlib   go1.24.13  1.26.9, 1.27.2  /usr/local/bin/app
+    Critical  CVE-2026-78663  stdlib   go1.24.13  1.26.9          /usr/local/bin/app
+    ↳ upgrade each package (or the base image) to a FIXED IN version; accept a known risk with --ignore-cve <ID>
+
+    Secret gate: 1 secret(s) shipped in the image
+    ● image    github-pat  /etc/app/config.yaml:4  ghp_********
+    ↳ remove the secret from the image (pass it at runtime); false positive: add file:rule:line to .gitleaksignore
 
   Critical & high vulnerabilities
     SEVERITY  ID              PACKAGE   VERSION          FIXED IN
@@ -175,8 +182,14 @@ $ forge run . --no-push
     Critical  CVE-2026-5450   libc-bin  2.36-9+deb12u14  —
     Critical  CVE-2026-5450   libc6     2.36-9+deb12u14  —
     High      CVE-2026-25679  stdlib    go1.24.13        1.25.8, 1.26.1
-    ...
-    … 76 more in the JSON report
+    High      CVE-2026-27145  stdlib    go1.24.13        1.25.11, 1.26.4
+    High      CVE-2026-32280  stdlib    go1.24.13        1.25.9, 1.26.2
+    High      CVE-2026-32281  stdlib    go1.24.13        1.25.9, 1.26.2
+    High      CVE-2026-32283  stdlib    go1.24.13        1.25.9, 1.26.2
+    High      CVE-2026-33811  stdlib    go1.24.13        1.25.10, 1.26.3
+    High      CVE-2026-33814  stdlib    go1.24.13        1.25.10, 1.26.3
+    High      CVE-2026-33818  stdlib    go1.24.13        1.25.13, 1.26.6, 1.27.0-rc.3
+    … 281 more in the JSON report (CI logs list them all)
 
   Hardening
     ● SEC003 base image not pinned by digest: debian:bookworm-slim (line 9)  −2
@@ -187,11 +200,11 @@ $ forge run . --no-push
         ↳ add HEALTHCHECK (or rely on Kubernetes liveness/readiness probes)
 
   Secrets
-    ● image    github-pat  /etc/app/config.yaml:4  ghp_********
+    ● context  github-pat  config.yaml:4  ghp_********
     accept a false positive: add its fingerprint (file:rule:line) to .gitleaksignore
 
   ╭─ forge ───────────────────────────────────────────────────────────────────────╮
-  │  digest    sha256:df2feedaf378…                                               │
+  │  digest    sha256:6cc4cce78d42…                                               │
   │  base      index.docker.io/library/debian@sha256:311f7a192fd9…                │
   │  size      47.9 MB → 32.6 MB  −32.0%                                          │
   │  layers    4 → 2                                                              │
@@ -200,10 +213,11 @@ $ forge run . --no-push
   │  secrets   1 in the image                                                     │
   │  gates     cve ✖ 2 ≥ critical with fix · sec ✔ 94 ≥ 50 · leaks ✖ 1 in image   │
   │  report    .forge/report.json                                                 │
-  │  result    ✖ blocked — 2 check(s) failed  in 9.9s                             │
+  │  result    ✖ blocked — 2 check(s) failed  in 10.5s                            │
   │            ↳ cve: 2 vulnerabilities at or above critical with a fix available │
   │            ↳ leaks: 1 secret(s) shipped in the image                          │
   ╰───────────────────────────────────────────────────────────────────────────────╯
+
 exit 1
 ```
 
@@ -251,6 +265,122 @@ $ forge doctor
   ▲ ghcr        no GHCR_TOKEN/GITHUB_TOKEN (docker config.json is used if present)
   ✔ ecr         ~/.aws/config found (set AWS_PROFILE to pick a profile)
 ```
+
+
+## No pipeline: tudo no log (o usuário nunca acessa o pod)
+
+O forge detecta o CI pelas variáveis padrão (`GITHUB_ACTIONS`, `GITLAB_CI`, `TF_BUILD`) e usa os
+recursos de cada um. Nada a configurar.
+
+| O que | GitHub Actions | GitLab | Azure DevOps |
+|---|---|---|---|
+| **Por que bloqueou** — lista completa, nunca cortada | no log | no log | no log |
+| **Todas as CVEs** (centenas) sem poluir o log | seção recolhível `::group::` | `section_start` recolhida | `##[group]` |
+| **Anotações** com arquivo:linha (topo da execução e PR) | `::error` / `::warning` | — | `##vso[task.logissue]` |
+| **Página de resumo** da execução (Markdown) | `$GITHUB_STEP_SUMMARY` | — | — |
+
+Log real no GitHub Actions (`examples/go-multistage`), da etapa Push até o fim — a seção recolhida
+tem as 293 CVEs:
+
+```
+  ○ Push    skipped (--no-push) 0ms
+
+  ✖ Why the push was blocked
+
+    CVE gate: 2 vulnerabilities ≥ critical with a fix available
+    SEVERITY  ID              PACKAGE  VERSION    FIXED IN        WHERE
+    Critical  CVE-2026-56857  stdlib   go1.24.13  1.26.9, 1.27.2  /usr/local/bin/app
+    Critical  CVE-2026-78663  stdlib   go1.24.13  1.26.9          /usr/local/bin/app
+    ↳ upgrade each package (or the base image) to a FIXED IN version; accept a known risk with --ignore-cve <ID>
+
+    Secret gate: 1 secret(s) shipped in the image
+    ● image    github-pat  /etc/app/config.yaml:4  ghp_********
+    ↳ remove the secret from the image (pass it at runtime); false positive: add file:rule:line to .gitleaksignore
+
+::group::forge: all 293 vulnerabilities (44 fixable) — click to expand
+    [... 296 lines collapsed ...]
+::endgroup::
+
+  Hardening
+    ● SEC003 base image not pinned by digest: debian:bookworm-slim (line 9)  −2
+        ↳ pin with @sha256:<digest> for reproducible, tamper-proof builds
+    ● SEC012 apt-get install without --no-install-recommends (line 10)  −2
+        ↳ add --no-install-recommends (smaller image, fewer CVEs)
+    · SEC008 no HEALTHCHECK  −2
+        ↳ add HEALTHCHECK (or rely on Kubernetes liveness/readiness probes)
+::error title=CVE-2026-56857 (critical)::stdlib go1.24.13 → fixed in 1.26.9, 1.27.2 (/usr/local/bin/app)
+::error title=CVE-2026-78663 (critical)::stdlib go1.24.13 → fixed in 1.26.9 (/usr/local/bin/app)
+::error title=secret%3A github-pat::Uncovered a GitHub Personal Access Token, potentially leading to unauthorized repository access and sensitive content exposure. in image /etc/app/config.yaml:4 (value redacted)
+::warning file=go-multistage/Dockerfile,line=9,title=SEC003::base image not pinned by digest: debian:bookworm-slim — pin with @sha256:<digest> for reproducible, tamper-proof builds
+::warning file=go-multistage/Dockerfile,line=10,title=SEC012::apt-get install without --no-install-recommends — add --no-install-recommends (smaller image, fewer CVEs)
+
+  Secrets
+    ● context  github-pat  config.yaml:4  ghp_********
+    accept a false positive: add its fingerprint (file:rule:line) to .gitleaksignore
+::warning file=go-multistage/config.yaml,line=4,title=secret in repository%3A github-pat::Uncovered a GitHub Personal Access Token, potentially leading to unauthorized repository access and sensitive content exposure. (value redacted)
+
+  ╭─ forge ───────────────────────────────────────────────────────────────────────╮
+  │  digest    sha256:be66e5804138…                                               │
+  │  base      index.docker.io/library/debian@sha256:311f7a192fd9…                │
+  │  size      47.9 MB → 32.6 MB  −32.0%                                          │
+  │  layers    4 → 2                                                              │
+  │  cves      4 critical · 84 high · 116 medium · 19 low                         │
+  │  score     94/100 (A)                                                         │
+  │  secrets   1 in the image                                                     │
+  │  gates     cve ✖ 2 ≥ critical with fix · sec ✔ 94 ≥ 50 · leaks ✖ 1 in image   │
+  │  report    .forge/report.json                                                 │
+  │  result    ✖ blocked — 2 check(s) failed  in 11.6s                            │
+  │            ↳ cve: 2 vulnerabilities at or above critical with a fix available │
+  │            ↳ leaks: 1 secret(s) shipped in the image                          │
+  ╰───────────────────────────────────────────────────────────────────────────────╯
+
+exit=1
+```
+
+Como aparece para o usuário:
+- **"✖ Why the push was blocked"** é a primeira coisa depois das etapas: exatamente as 2 CVEs que o gate
+  contou (com versão de correção e o arquivo dentro da imagem) e o segredo (arquivo:linha, valor mascarado).
+- **Todas as 293 CVEs** ficam no log, dentro de um bloco "click to expand".
+- As linhas `::error`/`::warning` viram **anotações** no topo da execução e no PR; as de hardening e do
+  segredo no repositório apontam o arquivo e a linha (`go-multistage/Dockerfile:10`, `config.yaml:4`).
+- A **página de resumo** do Actions mostra (Markdown real gerado):
+
+```markdown
+## ❌ forge — push blocked
+
+- **cve: 2 vulnerabilities at or above critical with a fix available**
+- **leaks: 1 secret(s) shipped in the image**
+
+| platform | size | layers | critical | high | medium | fixable | score | secrets in image |
+|---|---|---|---|---|---|---|---|---|
+| linux/amd64 | 47.9 MB → **32.6 MB** | 4 → 2 | 4 | 84 | 116 | 44 | 94 (A) | 1 |
+
+**Gates:** CVE fails on ≥ critical with a fix · hardening score ≥ 50 · no secret in the image
+
+### Why `linux/amd64` was blocked
+
+| severity | id | package | version | fixed in | where |
+|---|---|---|---|---|---|
+| Critical | CVE-2026-56857 | stdlib | go1.24.13 | 1.26.9, 1.27.2 | `/usr/local/bin/app` |
+| Critical | CVE-2026-78663 | stdlib | go1.24.13 | 1.26.9 | `/usr/local/bin/app` |
+
+- 🔑 **github-pat** in `/etc/app/config.yaml:4` (image) — value redacted
+
+<details><summary>All 293 vulnerabilities — linux/amd64</summary> … </details>
+```
+
+GitLab e Azure (mesmo conteúdo; muda só o marcador de seção e de anotação):
+
+```
+\e[0Ksection_start:1795691551:forge_1_forge_all_293_vulnerabilities_44_fixable_click_to_expand[collapsed=true]
+...
+##[group]forge: all 293 vulnerabilities (44 fixable) — click to expand
+##vso[task.logissue type=error]CVE-2026-56857 (critical): stdlib go1.24.13 → fixed in 1.26.9, 1.27.2 (/usr/local/bin/app)
+##vso[task.logissue type=warning;sourcepath=go-multistage/Dockerfile;linenumber=10]SEC012: apt-get install without --no-install-recommends — ...
+```
+
+O relatório JSON continua sendo gravado (`--report`); publique-o como artefato do job
+(`actions/upload-artifact`) para auditoria — mas o usuário não depende dele: o log tem tudo.
 
 ## Relatório JSON
 

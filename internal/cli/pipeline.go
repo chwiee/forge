@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/chwiee/forge/internal/builder"
 	"github.com/chwiee/forge/internal/cache"
+	"github.com/chwiee/forge/internal/ci"
 	"github.com/chwiee/forge/internal/emulation"
 	"github.com/chwiee/forge/internal/leaks"
 	"github.com/chwiee/forge/internal/registry"
@@ -422,40 +424,166 @@ func doPush(ctx context.Context, u *ui.UI, art registry.Artifact, t *registry.Ta
 
 // ---- details ----
 
-func printDetails(u *ui.UI, title string, cve *scan.Report, s *sec.Report, lk *leaks.Report) {
+// detailCtx locates files so CI annotations can point at Dockerfile lines.
+type detailCtx struct {
+	dockerfile string // absolute
+	contextDir string // absolute
+}
+
+// gateVulns returns exactly the vulnerabilities the CVE gate counted.
+func gateVulns(r *scan.Report, g report.GateConfig) []scan.Vuln {
+	if r == nil || strings.EqualFold(g.FailOn, "none") {
+		return nil
+	}
+	limit := scan.Rank(normSev(g.FailOn))
+	var out []scan.Vuln
+	for _, v := range r.Vulns {
+		if scan.Rank(v.Severity) <= limit && (!g.OnlyFixed || v.FixedIn != "") {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func vulnRow(v scan.Vuln, withPath bool) []string {
+	fix := v.FixedIn
+	if fix == "" {
+		fix = "—"
+	}
+	id := v.ID
+	if v.KEV {
+		id += " (KEV)"
+	}
+	row := []string{v.Severity, id, v.Package, v.Version, fix}
+	if withPath {
+		row = append(row, v.Path)
+	}
+	return row
+}
+
+// printDetails writes everything a pipeline user needs into the log: they never
+// get a shell in the runner pod. Order: why it was blocked (complete), then all
+// vulnerabilities (collapsed section in CI), hardening, secrets; finally CI
+// annotations pointing at the blocking items.
+func printDetails(u *ui.UI, title string, cve *scan.Report, s *sec.Report, lk *leaks.Report, g report.GateConfig, dc detailCtx) {
+	prov := ci.Detect()
+	var anns []ci.Annotation
+	tag := ""
+	if title != "" {
+		tag = "[" + strings.TrimPrefix(title, "linux/") + "] "
+	}
 	if title != "" && (cve != nil && len(cve.Vulns) > 0 || s != nil && len(s.Findings) > 0 || lk != nil && len(lk.Findings) > 0) {
 		u.Line("")
 		u.Line("  " + u.Accent("◆ "+title))
 	}
-	if cve != nil && len(cve.Vulns) > 0 {
-		var rows [][]string
-		for _, v := range cve.Vulns {
-			if scan.Rank(v.Severity) > 1 || len(rows) >= 12 {
-				continue
-			}
-			fix := v.FixedIn
-			if fix == "" {
-				fix = "—"
-			}
-			id := v.ID
-			if v.KEV {
-				id += " (KEV)"
-			}
-			rows = append(rows, []string{v.Severity, id, v.Package, v.Version, fix})
+	sevColor := func(s string) string {
+		switch s {
+		case "Critical":
+			return u.Bad(s)
+		case "High":
+			return u.Warning(s)
 		}
-		if len(rows) > 0 {
-			u.Line("")
-			u.Line("  " + u.Bold("Critical & high vulnerabilities"))
-			sevColor := func(s string) string {
-				if s == "Critical" {
-					return u.Bad(s)
-				}
-				return u.Warning(s)
+		return s
+	}
+
+	// ---- 1. why the push was blocked: complete, never truncated ----
+	var blockCVE []scan.Vuln
+	if cve != nil && cve.Failed {
+		blockCVE = gateVulns(cve, g)
+	}
+	var blockLeaks []leaks.Finding
+	if lk != nil && lk.Failed {
+		for _, f := range lk.Findings {
+			if f.Where != leaks.InContext || lk.Blocking > 0 && f.Where == leaks.InContext && lk.Warnings == 0 {
+				blockLeaks = append(blockLeaks, f)
 			}
-			u.Table([]string{"SEVERITY", "ID", "PACKAGE", "VERSION", "FIXED IN"}, rows, []func(string) string{sevColor, u.Value, nil, u.Muted, u.Good})
-			total := cve.Counts["Critical"] + cve.Counts["High"]
-			if total > len(rows) {
-				u.Line("    " + u.Muted(fmt.Sprintf("… %d more in the JSON report", total-len(rows))))
+		}
+	}
+	secBlocked := s != nil && s.Failed
+	if len(blockCVE) > 0 || len(blockLeaks) > 0 || secBlocked {
+		u.Line("")
+		u.Line("  " + u.Bad(u.Bold("✖ Why the push was blocked")))
+		if len(blockCVE) > 0 {
+			what := "≥ " + strings.ToLower(g.FailOn)
+			if g.OnlyFixed {
+				what += " with a fix available"
+			}
+			u.Line("")
+			u.Line(fmt.Sprintf("    %s %d vulnerabilit%s %s", u.Bold("CVE gate:"), len(blockCVE), plural(len(blockCVE), "y", "ies"), u.Muted(what)))
+			rows := make([][]string, 0, len(blockCVE))
+			for _, v := range blockCVE {
+				rows = append(rows, vulnRow(v, true))
+				anns = append(anns, ci.Annotation{Level: ci.Error, Title: tag + v.ID + " (" + strings.ToLower(v.Severity) + ")",
+					Msg: fmt.Sprintf("%s %s → fixed in %s (%s)", v.Package, v.Version, v.FixedIn, v.Path)})
+			}
+			u.Table([]string{"SEVERITY", "ID", "PACKAGE", "VERSION", "FIXED IN", "WHERE"}, rows, []func(string) string{sevColor, u.Value, nil, u.Muted, u.Good, u.Muted})
+			u.Line("    " + u.Good("↳ ") + u.Muted("upgrade each package (or the base image) to a FIXED IN version; accept a known risk with --ignore-cve <ID>"))
+		}
+		if len(blockLeaks) > 0 {
+			u.Line("")
+			u.Line(fmt.Sprintf("    %s %d secret(s) shipped in the image", u.Bold("Secret gate:"), len(blockLeaks)))
+			for _, f := range blockLeaks {
+				u.Line(fmt.Sprintf("    %s %-8s %s  %s  %s", u.Bad("●"), f.Where, u.Value(f.Rule), loc(f), u.Muted(f.Secret)))
+				anns = append(anns, ci.Annotation{Level: ci.Error, Title: tag + "secret: " + f.Rule,
+					Msg: fmt.Sprintf("%s in %s %s (value redacted)", f.Description, f.Where, loc(f))})
+			}
+			u.Line("    " + u.Good("↳ ") + u.Muted("remove the secret from the image (pass it at runtime); false positive: add file:rule:line to .gitleaksignore"))
+		}
+		if secBlocked {
+			u.Line("")
+			u.Line(fmt.Sprintf("    %s score %d below the minimum %d — biggest penalties:", u.Bold("Hardening gate:"), s.Score, g.MinScore))
+			fs := append([]sec.Finding{}, s.Findings...)
+			sort.SliceStable(fs, func(i, j int) bool { return fs[i].Penalty > fs[j].Penalty })
+			for _, f := range fs {
+				if f.Penalty == 0 {
+					continue
+				}
+				u.Line(fmt.Sprintf("    %s %s %s  %s", u.Bad("−"+strconv.Itoa(f.Penalty)), u.Muted(f.ID), f.Title, u.Muted("↳ "+f.Fix)))
+			}
+			anns = append(anns, ci.Annotation{Level: ci.Error, Title: tag + "hardening score",
+				Msg: fmt.Sprintf("score %d below the minimum %d", s.Score, g.MinScore)})
+		}
+	}
+
+	// ---- 2. every vulnerability: collapsed section in CI logs ----
+	if cve != nil && len(cve.Vulns) > 0 {
+		if prov != ci.None {
+			u.Line("")
+			fixable := 0
+			for _, n := range cve.Fixable {
+				fixable += n
+			}
+			prov.Group(u.Out(), fmt.Sprintf("forge: %sall %d vulnerabilities (%d fixable) — click to expand", tag, len(cve.Vulns), fixable), func() {
+				rows := make([][]string, 0, len(cve.Vulns))
+				for _, v := range cve.Vulns {
+					rows = append(rows, vulnRow(v, true))
+				}
+				u.Table([]string{"SEVERITY", "ID", "PACKAGE", "VERSION", "FIXED IN", "WHERE"}, rows, []func(string) string{sevColor, u.Value, nil, u.Muted, u.Good, u.Muted})
+			})
+		} else {
+			var rows [][]string
+			for _, v := range cve.Vulns {
+				if scan.Rank(v.Severity) > 1 || len(rows) >= 12 {
+					continue
+				}
+				rows = append(rows, vulnRow(v, false))
+			}
+			if len(rows) > 0 {
+				u.Line("")
+				u.Line("  " + u.Bold("Critical & high vulnerabilities"))
+				u.Table([]string{"SEVERITY", "ID", "PACKAGE", "VERSION", "FIXED IN"}, rows, []func(string) string{sevColor, u.Value, nil, u.Muted, u.Good})
+				if more := len(cve.Vulns) - len(rows); more > 0 {
+					u.Line("    " + u.Muted(fmt.Sprintf("… %d more in the JSON report (CI logs list them all)", more)))
+				}
+			}
+		}
+	}
+	defer func() { prov.Annotate(u.Out(), anns) }() // after every section appended its annotations
+	if s != nil {
+		for _, f := range s.Findings {
+			if f.Line > 0 && f.Penalty > 0 && !secBlocked {
+				anns = append(anns, ci.Annotation{Level: ci.Warning, Title: tag + f.ID, Msg: f.Title + " — " + f.Fix,
+					File: ci.RepoPath(dc.dockerfile), Line: f.Line})
 			}
 		}
 	}
@@ -489,22 +617,46 @@ func printDetails(u *ui.UI, title string, cve *scan.Report, s *sec.Report, lk *l
 			}
 		}
 	}
-	if lk != nil && len(lk.Findings) > 0 {
-		u.Line("")
-		u.Line("  " + u.Bold("Secrets"))
-		for _, f := range lk.Findings {
-			icon := u.Bad("●")
-			if f.Where == leaks.InContext {
-				icon = u.Warning("●")
-			}
-			loc := f.File
-			if f.Line > 0 {
-				loc += ":" + strconv.Itoa(f.Line)
-			}
-			u.Line(fmt.Sprintf("    %s %-8s %s  %s  %s", icon, f.Where, u.Value(f.Rule), loc, u.Muted(f.Secret)))
+	if lk != nil {
+		shown := map[string]bool{}
+		for _, f := range blockLeaks {
+			shown[f.Fingerprint+f.Where] = true
 		}
-		u.Line("    " + u.Muted("accept a false positive: add its fingerprint (file:rule:line) to .gitleaksignore"))
+		var rest []leaks.Finding
+		for _, f := range lk.Findings {
+			if !shown[f.Fingerprint+f.Where] {
+				rest = append(rest, f)
+			}
+		}
+		if len(rest) > 0 {
+			u.Line("")
+			u.Line("  " + u.Bold("Secrets"))
+			for _, f := range rest {
+				icon := u.Bad("●")
+				if f.Where == leaks.InContext {
+					icon = u.Warning("●")
+					anns = append(anns, ci.Annotation{Level: ci.Warning, Title: tag + "secret in repository: " + f.Rule,
+						Msg: f.Description + " (value redacted)", File: ci.RepoPath(filepath.Join(dc.contextDir, f.File)), Line: f.Line})
+				}
+				u.Line(fmt.Sprintf("    %s %-8s %s  %s  %s", icon, f.Where, u.Value(f.Rule), loc(f), u.Muted(f.Secret)))
+			}
+			u.Line("    " + u.Muted("accept a false positive: add its fingerprint (file:rule:line) to .gitleaksignore"))
+		}
 	}
+}
+
+func loc(f leaks.Finding) string {
+	if f.Line > 0 {
+		return f.File + ":" + strconv.Itoa(f.Line)
+	}
+	return f.File
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 func severityLine(u *ui.UI, r *scan.Report) string {
@@ -546,4 +698,9 @@ func summarize(rep *report.Report) {
 		}
 	}
 	rep.Passed = len(rep.Failures) == 0
+}
+
+// policy is the gate configuration as recorded in reports.
+func (f *gateFlags) policy() report.GateConfig {
+	return report.GateConfig{FailOn: f.failOn, OnlyFixed: f.onlyFixed, MinScore: f.minScore}
 }

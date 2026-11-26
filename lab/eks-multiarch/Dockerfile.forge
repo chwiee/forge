@@ -1,0 +1,20 @@
+# forge itself as a multi-arch image for the lab (context = forge repo root):
+#   forge run . -f lab/eks-multiarch/Dockerfile.forge --platform linux/amd64,linux/arm64 ...
+# The build stage always runs on the BUILD platform and cross-compiles with
+# GOARCH=$TARGETARCH, so producing the arm64 image needs no emulation.
+FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm AS build
+ARG TARGETARCH
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -ldflags "-s -w" -o /out/forge ./cmd/forge
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /out/forge /usr/local/bin/forge
+ENV FORGE_CACHE_DIR=/cache \
+    FORGE_PLAIN=1
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/forge"]
+CMD ["--help"]

@@ -1,0 +1,63 @@
+# One build = one Job per (app, arch). The amd64 and arm64 Jobs of the same app run
+# at the same time on different node groups and share --build-id: each pushes
+# <tag>-<arch>, and whichever finishes last writes the multi-arch index <tag>.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-__APP__-__ARCH__
+  namespace: forge-ci
+  labels: {forge.dev/app: __APP__, forge.dev/arch: __ARCH__, forge.dev/run: __TAG__}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1500
+  ttlSecondsAfterFinished: 7200
+  template:
+    metadata:
+      labels: {forge.dev/app: __APP__, forge.dev/arch: __ARCH__, forge.dev/run: __TAG__}
+    spec:
+      restartPolicy: Never
+      hostUsers: false                      # root in the pod = unprivileged uid on the node
+      serviceAccountName: forge-builder     # Pod Identity -> push only to __REPO_PREFIX__/*
+      securityContext:
+        seccompProfile: {type: Unconfined}  # forge creates a nested user namespace for RUN
+      nodeSelector:
+        kubernetes.io/arch: __ARCH__        # native build on the matching node group
+      initContainers:
+        - name: sources                     # lab shortcut: app sources come from a ConfigMap
+          image: public.ecr.aws/docker/library/busybox:1.37
+          command: ["tar", "-xzf", "/src/src.tgz", "-C", "/workspace"]
+          volumeMounts:
+            - {name: src, mountPath: /src}
+            - {name: workspace, mountPath: /workspace}
+      containers:
+        - name: forge
+          image: __FORGE_IMAGE__
+          args:
+            - run
+            - /workspace
+            - --registry=ecr
+            - --name=__REPO_PREFIX__/__APP__
+            - --create-repo
+            - --tag=__TAG__
+            - --multiarch=linux/amd64,linux/arm64
+            - --build-id=__TAG__
+          env:
+            - {name: AWS_REGION, value: __REGION__}
+            - {name: FORGE_ECR_ACCOUNT, value: "__ACCOUNT__"}
+            - {name: FORGE_DB_URL, value: "http://forge-db.forge-ci.svc.cluster.local:8080/databases"}
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+          resources:
+            requests: {cpu: "1", memory: 3Gi}
+            limits: {memory: 5Gi}
+          volumeMounts:
+            - {name: workspace, mountPath: /workspace}
+            - {name: cache, mountPath: /cache}
+      volumes:
+        - name: src
+          configMap: {name: src-__APP__}
+        - name: workspace
+          emptyDir: {}
+        - name: cache
+          emptyDir: {sizeLimit: 15Gi}

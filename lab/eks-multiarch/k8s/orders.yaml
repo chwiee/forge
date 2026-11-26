@@ -1,0 +1,40 @@
+# The approved image, referenced by ONE tag (no -amd64/-arm64 suffix). Two replicas
+# forced onto different architectures: each node pulls its own variant from the index.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-go
+  namespace: forge-lab-apps
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: orders-go}
+  template:
+    metadata:
+      labels: {app: orders-go}
+    spec:
+      automountServiceAccountToken: false
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/arch
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: orders-go}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: orders
+          image: __REGISTRY__/__REPO_PREFIX__/orders-go:__TAG__
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}

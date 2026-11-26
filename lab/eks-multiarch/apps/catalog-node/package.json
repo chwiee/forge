@@ -1,0 +1,16 @@
+{
+  "name": "catalog-node",
+  "version": "1.0.0",
+  "description": "Lab app with a known-vulnerable dependency: forge must block it",
+  "main": "server.js",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "4.17.1",
+    "lodash": "4.17.11",
+    "morgan": "1.9.1"
+  }
+}

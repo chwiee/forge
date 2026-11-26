@@ -1,0 +1,252 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  forge multi-arch lab: disposable EKS cluster with one amd64 and one arm64 managed
+  node group (private subnets, single NAT), Pod Identity role that lets the forge
+  build pods push only to ECR repositories under forge-lab/. One stack: create with
+  up.sh, delete with down.sh.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    why: >-
+      Prove that forge --multiarch builds natively on separate amd64/arm64 node groups
+      in parallel and that only the approved image gets a multi-arch index in ECR.
+    must:
+      - Single-Region project: deploy only in the project's selected Region (us-east-2).
+      - Nothing stateful lives here; deleting the stack must leave no cost behind.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: forge-lab
+  KubernetesVersion:
+    Type: String
+    Description: EKS version (up.sh passes the newest one in standard support; user namespaces need 1.33+)
+  AdminCidr:
+    Type: String
+    Description: Only this CIDR (your public IP /32) reaches the public Kubernetes API endpoint
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(3[0-2]|[12]?\d)$'
+  RepoPrefix:
+    Type: String
+    Default: forge-lab
+  AmdInstanceTypes:
+    Type: CommaDelimitedList
+    Default: m7i.xlarge,m6i.xlarge
+  ArmInstanceTypes:
+    Type: CommaDelimitedList
+    Default: m7g.xlarge,m6g.xlarge
+
+Resources:
+  # ------------------------------------------------------------------ network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.40.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: !Ref ClusterName}]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw}
+
+  PublicA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.0.0/20
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${ClusterName}-public-a"}, {Key: kubernetes.io/role/elb, Value: "1"}]
+  PublicB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.16.0/20
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${ClusterName}-public-b"}, {Key: kubernetes.io/role/elb, Value: "1"}]
+  PrivateA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.64.0/19
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${ClusterName}-private-a"}]
+  PrivateB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.96.0/19
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{Key: Name, Value: !Sub "${ClusterName}-private-b"}]
+
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PublicDefault:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: {RouteTableId: !Ref PublicRt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw}
+  PublicARt:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicA, RouteTableId: !Ref PublicRt}
+  PublicBRt:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicB, RouteTableId: !Ref PublicRt}
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties: {Domain: vpc}
+  Nat:
+    Type: AWS::EC2::NatGateway
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: One NAT (not one per AZ) is enough for a lab; nodes stay private and still reach registries.
+    Properties: {AllocationId: !GetAtt NatEip.AllocationId, SubnetId: !Ref PublicA}
+
+  PrivateRt:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PrivateDefault:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PrivateRt, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref Nat}
+  PrivateARt:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateA, RouteTableId: !Ref PrivateRt}
+  PrivateBRt:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateB, RouteTableId: !Ref PrivateRt}
+
+  # ------------------------------------------------------------------ IAM
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: eks.amazonaws.com}
+            Action: [sts:AssumeRole, sts:TagSession]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonEKSClusterPolicy]
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  ForgeRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Credentials for the forge build pods via EKS Pod Identity; no secrets in the cluster.
+        must:
+          - Push/create only under the RepoPrefix/ repositories (least privilege).
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: [sts:AssumeRole, sts:TagSession]
+            Condition:
+              StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}
+      Policies:
+        - PolicyName: ecr-push-lab-repos
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:CreateRepository
+                  - ecr:DescribeRepositories
+                  - ecr:TagResource
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RepoPrefix}/*"
+
+  # ------------------------------------------------------------------ EKS
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      UpgradePolicy: {SupportType: STANDARD}   # never fall into paid extended support
+      AccessConfig:
+        AuthenticationMode: API
+        BootstrapClusterCreatorAdminPermissions: true
+      ResourcesVpcConfig:
+        SubnetIds: [!Ref PrivateA, !Ref PrivateB, !Ref PublicA, !Ref PublicB]
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs: [!Ref AdminCidr]
+
+  PodIdentityAgent:
+    Type: AWS::EKS::Addon
+    Properties: {ClusterName: !Ref Cluster, AddonName: eks-pod-identity-agent, ResolveConflicts: OVERWRITE}
+
+  ForgeIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: forge-ci
+      ServiceAccount: forge-builder
+      RoleArn: !GetAtt ForgeRole.Arn
+
+  NodesAmd64:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: PrivateDefault
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: amd64
+      NodeRole: !GetAtt NodeRole.Arn
+      AmiType: AL2023_x86_64_STANDARD
+      CapacityType: ON_DEMAND
+      InstanceTypes: !Ref AmdInstanceTypes
+      DiskSize: 60
+      Subnets: [!Ref PrivateA, !Ref PrivateB]
+      ScalingConfig: {MinSize: 1, DesiredSize: 1, MaxSize: 1}
+      Labels: {forge.dev/pool: amd64}
+
+  NodesArm64:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: PrivateDefault
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: arm64
+      NodeRole: !GetAtt NodeRole.Arn
+      AmiType: AL2023_ARM_64_STANDARD
+      CapacityType: ON_DEMAND
+      InstanceTypes: !Ref ArmInstanceTypes
+      DiskSize: 60
+      Subnets: [!Ref PrivateA, !Ref PrivateB]
+      ScalingConfig: {MinSize: 1, DesiredSize: 1, MaxSize: 1}
+      Labels: {forge.dev/pool: arm64}
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  ForgeRoleArn:
+    Value: !GetAtt ForgeRole.Arn
